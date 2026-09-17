@@ -1,0 +1,16 @@
+# Núcleo criptográfico — SOLO librerías establecidas y auditadas, nunca primitivas propias
+cryptography>=42.0     # AES-256-GCM (AEAD) y HKDF-SHA256
+argon2-cffi>=23.1      # Argon2id para derivación de clave desde contraseña
+
+# Interfaz
+PySide6>=6.7           # Qt 6: widgets, multimedia (reproducción desde QIODevice en RAM)
+
+# Miniaturas
+Pillow>=10.3           # decodificación de imágenes y generación de JPEG de miniatura
+av>=12.0               # PyAV (ffmpeg) para extraer un fotograma de los videos
+
+# Filtros del visor (gamma, saturación, nitidez…): LUTs por píxel en RAM
+numpy>=1.26
+
+# Desarrollo
+pytest>=8.0

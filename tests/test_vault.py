@@ -1,0 +1,282 @@
+"""Pruebas de integración del contenedor: crear/abrir, importar/exportar,
+propiedades anti-fuga de metadatos y resistencia a manipulación en disco."""
+
+import io
+import json
+import os
+from pathlib import Path
+
+import pytest
+from PIL import Image
+
+from boveda import crypto_core as cc
+from boveda.storage import FIXED_TS
+from boveda.thumbs import make_thumbnail
+from boveda.vault import Vault, VaultError
+
+FAST = {"m_kib": 8192, "t": 1, "p": 1}
+PW = "contraseña-de-prueba"
+
+
+@pytest.fixture()
+def vault(tmp_path):
+    return Vault.create(tmp_path / "v.vault", PW, FAST)
+
+
+def make_photo(tmp_path, name="foto.png", size=(640, 480)) -> Path:
+    img = Image.new("RGB", size)
+    px = img.load()
+    for x in range(size[0]):
+        for y in range(0, size[1], 7):
+            px[x, y] = (x % 256, y % 256, (x * y) % 256)
+    p = tmp_path / name
+    img.save(p)
+    return p
+
+
+def make_big_file(tmp_path, name="video.mp4", nbytes=int(2.5 * cc.CHUNK_SIZE)) -> Path:
+    p = tmp_path / name
+    p.write_bytes(os.urandom(nbytes))
+    return p
+
+
+def _import(vault, path, mime="image"):
+    return vault.import_file(path, mime, make_thumbnail(path, mime))
+
+
+def test_create_reopen_and_wrong_password(tmp_path, vault):
+    photo = make_photo(tmp_path)
+    e = _import(vault, photo)
+    vault.lock()
+
+    v2 = Vault.open(tmp_path / "v.vault", PW)
+    assert [x.name for x in v2.entries()] == ["foto.png"]
+    assert v2.get(e.id).size == photo.stat().st_size
+
+    with pytest.raises(cc.VaultCryptoError):
+        Vault.open(tmp_path / "v.vault", "incorrecta")
+
+
+def test_roundtrip_export_identical(tmp_path, vault):
+    src = make_big_file(tmp_path)  # multi-chunk, con padding en el último
+    e = vault.import_file(src, "video", None)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    out = vault.export_file(e.id, out_dir)
+    assert out.read_bytes() == src.read_bytes()
+
+
+def test_reader_random_access(tmp_path, vault):
+    src = make_big_file(tmp_path, nbytes=3 * cc.CHUNK_SIZE + 12345)
+    original = src.read_bytes()
+    e = vault.import_file(src, "video", None)
+    r = vault.open_reader(e.id)
+    assert r.size == len(original)
+    # saltos aleatorios como los que hace un demuxer de video
+    for start, ln in [(0, 100), (cc.CHUNK_SIZE - 5, 20), (2 * cc.CHUNK_SIZE + 7, 50000),
+                      (len(original) - 33, 100), (len(original) - 1, 1)]:
+        r.seek(start)
+        assert r.read(ln) == original[start : start + ln]
+    r.seek(-10, 2)
+    assert r.read() == original[-10:]
+
+
+def test_thumbnail_encrypted_and_recoverable(tmp_path, vault):
+    e = _import(vault, make_photo(tmp_path))
+    data = vault.read_thumb(e.id)
+    assert data is not None and data[:2] == b"\xff\xd8"  # es un JPEG
+    # y en disco NO existe ningún JPEG en claro
+    for f in (tmp_path / "v.vault").rglob("*"):
+        if f.is_file():
+            assert not f.read_bytes().startswith(b"\xff\xd8")
+
+
+def test_all_blobs_identical_size_and_normalized_timestamps(tmp_path, vault):
+    _import(vault, make_photo(tmp_path, "a.png"))
+    vault.import_file(make_big_file(tmp_path, "b.mp4"), "video", None)
+    blobs = list((tmp_path / "v.vault" / "blobs").rglob("*.blob"))
+    assert len(blobs) >= 5  # 1 chunk foto + thumb + 3 chunks video
+    sizes = {b.stat().st_size for b in blobs}
+    # TODOS los blobs miden exactamente chunk + nonce + tag
+    assert sizes == {cc.CHUNK_SIZE + cc.NONCE_LEN + cc.TAG_LEN}
+    for b in blobs:
+        assert int(b.stat().st_mtime) == FIXED_TS
+
+
+def test_index_padded_to_power_of_two(tmp_path, vault):
+    for i in range(5):
+        _import(vault, make_photo(tmp_path, f"f{i}.png"))
+    n = (tmp_path / "v.vault" / "index.enc").stat().st_size - cc.NONCE_LEN - cc.TAG_LEN
+    assert n >= 4096 and (n & (n - 1)) == 0  # potencia de dos
+
+
+def test_no_plaintext_metadata_on_disk(tmp_path, vault):
+    """Ni nombres, ni contenido, ni estructura aparecen en claro en el disco."""
+    secret_name = "mi-nombre-secretisimo.png"
+    _import(vault, make_photo(tmp_path, secret_name))
+    for f in (tmp_path / "v.vault").rglob("*"):
+        if f.is_file():
+            assert secret_name.encode() not in f.read_bytes()
+    header = json.loads((tmp_path / "v.vault" / "header.json").read_text())
+    assert set(header) == {"magic", "version", "kdf", "mk_wrapped"}
+
+
+def test_tampered_blob_detected(tmp_path, vault):
+    src = make_big_file(tmp_path)
+    e = vault.import_file(src, "video", None)
+    blob_path = vault.store.path_for(e.chunks[1])
+    raw = bytearray(blob_path.read_bytes())
+    raw[len(raw) // 2] ^= 0x01  # voltear un bit del ciphertext
+    blob_path.write_bytes(bytes(raw))
+    r = vault.open_reader(e.id)
+    r.seek(cc.CHUNK_SIZE)  # caer en el chunk manipulado
+    with pytest.raises(cc.VaultCryptoError):
+        r.read(10)
+
+
+def test_swapped_chunks_detected(tmp_path, vault):
+    """Intercambiar físicamente dos blobs del mismo archivo debe detectarse:
+    el AAD ata cada chunk a su posición."""
+    src = make_big_file(tmp_path)
+    e = vault.import_file(src, "video", None)
+    p0, p1 = vault.store.path_for(e.chunks[0]), vault.store.path_for(e.chunks[1])
+    d0, d1 = p0.read_bytes(), p1.read_bytes()
+    p0.write_bytes(d1)
+    p1.write_bytes(d0)
+    r = vault.open_reader(e.id)
+    with pytest.raises(cc.VaultCryptoError):
+        r.read(10)
+
+
+def test_delete_removes_blobs(tmp_path, vault):
+    e = _import(vault, make_photo(tmp_path))
+    blob_dir = tmp_path / "v.vault" / "blobs"
+    assert list(blob_dir.rglob("*.blob"))
+    vault.delete_file(e.id)
+    assert not list(blob_dir.rglob("*.blob"))
+    assert vault.entries() == []
+
+
+def test_change_password(tmp_path, vault):
+    e = _import(vault, make_photo(tmp_path))
+    vault.change_password(PW, "nueva-contraseña", FAST)
+    vault.lock()
+    with pytest.raises(cc.VaultCryptoError):
+        Vault.open(tmp_path / "v.vault", PW)
+    v2 = Vault.open(tmp_path / "v.vault", "nueva-contraseña")
+    assert v2.read_thumb(e.id)[:2] == b"\xff\xd8"  # la MK sobrevivió al cambio
+
+
+def test_locked_vault_refuses_operations(tmp_path, vault):
+    e = _import(vault, make_photo(tmp_path))
+    vault.lock()
+    assert vault.is_locked
+    with pytest.raises((VaultError, KeyError)):
+        vault.read_thumb(e.id)
+
+
+def test_tiny_file(tmp_path, vault):
+    p = tmp_path / "chico.jpg"
+    p.write_bytes(b"abc")
+    e = vault.import_file(p, "image", None)
+    r = vault.open_reader(e.id)
+    assert r.read(-1) == b"abc"
+
+
+def test_folders_roundtrip_and_persistence(tmp_path, vault):
+    vault.create_folder("Vacaciones-Secretas")
+    e1 = _import(vault, make_photo(tmp_path, "a.png"))
+    e2 = _import(vault, make_photo(tmp_path, "b.png"))
+    vault.move_files([e1.id], "Vacaciones-Secretas")
+
+    assert [x.id for x in vault.entries("Vacaciones-Secretas")] == [e1.id]
+    assert [x.id for x in vault.entries("")] == [e2.id]
+    assert len(vault.entries()) == 2  # None = todo
+
+    # las carpetas sobreviven a cerrar y reabrir (viven en el índice cifrado)
+    vault.lock()
+    v2 = Vault.open(tmp_path / "v.vault", PW)
+    assert v2.folders() == ["Vacaciones-Secretas"]
+    assert v2.get(e1.id).folder == "Vacaciones-Secretas"
+
+    # y su nombre JAMÁS aparece en claro en el disco
+    for f in (tmp_path / "v.vault").rglob("*"):
+        if f.is_file():
+            assert b"Vacaciones-Secretas" not in f.read_bytes()
+
+
+def test_import_directly_into_folder(tmp_path, vault):
+    vault.create_folder("Album")
+    e = vault.import_file(make_photo(tmp_path), "image", None, folder="Album")
+    assert vault.entries("Album")[0].id == e.id
+
+
+def test_delete_folder_moves_content_to_root(tmp_path, vault):
+    vault.create_folder("Temp")
+    e = vault.import_file(make_photo(tmp_path), "image", None, folder="Temp")
+    vault.delete_folder("Temp")
+    assert vault.folders() == []
+    assert vault.get(e.id).folder == ""          # el archivo NO se borró
+    assert vault.entries("")[0].id == e.id
+
+
+def test_marks_persist_encrypted(tmp_path, vault):
+    src = make_big_file(tmp_path)
+    e = vault.import_file(src, "video", None)
+    # acepta enteros, pares [ms, etiqueta] y tríos [ms, etiqueta, rotación];
+    # ordena y deduplica por tiempo
+    vault.set_marks(e.id, [90000, [5000, "inicio"], 5000, (30000, "gol", 180)])
+    assert vault.get(e.id).marks == [
+        [5000, "", None], [30000, "gol", 180], [90000, "", None]]
+    vault.lock()
+    v2 = Vault.open(tmp_path / "v.vault", PW)           # persisten entre sesiones
+    assert v2.get(e.id).marks == [
+        [5000, "", None], [30000, "gol", 180], [90000, "", None]]
+    v2.set_marks(e.id, [])                              # y se pueden borrar
+    assert v2.get(e.id).marks == []
+
+
+def test_resume_rotation_favorite_persist(tmp_path, vault):
+    e_vid = vault.import_file(make_big_file(tmp_path), "video", None)
+    e_img = _import(vault, make_photo(tmp_path))
+    vault.set_resume(e_vid.id, 123456)
+    vault.set_rotation(e_vid.id, 270)
+    vault.set_favorite(e_img.id, True)
+    assert [x.id for x in vault.entries(favorites=True)] == [e_img.id]
+    vault.lock()
+    v2 = Vault.open(tmp_path / "v.vault", PW)
+    assert v2.get(e_vid.id).resume_ms == 123456
+    assert v2.get(e_vid.id).rotation == 270
+    assert v2.get(e_img.id).favorite is True
+    assert [x.id for x in v2.entries(favorites=True)] == [e_img.id]
+    v2.set_favorite(e_img.id, False)
+    assert v2.entries(favorites=True) == []
+
+
+def test_thumb_rotation_and_scale_independent(tmp_path, vault):
+    e = _import(vault, make_photo(tmp_path))
+    vault.rotate_thumbs([e.id])
+    vault.rotate_thumbs([e.id])
+    vault.set_thumb_scale([e.id], 2.0)
+    assert vault.get(e.id).thumb_rotation == 180
+    assert vault.get(e.id).rotation == 0        # girar el thumb NO gira el contenido
+    vault.set_rotation(e.id, 90)
+    assert vault.get(e.id).thumb_rotation == 180  # ni al revés
+    vault.lock()
+    v2 = Vault.open(tmp_path / "v.vault", PW)     # ambos persisten por separado
+    assert v2.get(e.id).thumb_rotation == 180
+    assert v2.get(e.id).thumb_scale == 2.0
+    assert v2.get(e.id).rotation == 90
+
+
+def test_folder_validation(tmp_path, vault):
+    with pytest.raises(VaultError):
+        vault.create_folder("con/barra")
+    with pytest.raises(VaultError):
+        vault.create_folder("   ")
+    vault.create_folder("Unica")
+    with pytest.raises(VaultError):
+        vault.create_folder("Unica")             # duplicada
+    e = _import(vault, make_photo(tmp_path))
+    with pytest.raises(VaultError):
+        vault.move_files([e.id], "NoExiste")

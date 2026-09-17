@@ -1,0 +1,12 @@
+# Entorno y artefactos de build — regenerables, nunca al repo
+.venv/
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Por si alguna vez se crea una bóveda de prueba dentro del proyecto:
+# los datos cifrados del usuario JAMÁS van al repositorio.
+*.vault/
