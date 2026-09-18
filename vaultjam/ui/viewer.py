@@ -367,6 +367,7 @@ class ViewerWindow(QDialog):
         self._jump_stack: list[int] = []        # posiciones para «volver» (⌫)
         self._clip_worker: _ClipWorker | None = None
         self.content_added = False              # la ventana principal recarga
+        self.thumbs_changed: set[str] = set()   # miniaturas a invalidar en caché
         self._advance_fade = False              # el próximo cambio viene del
         self._slide_t0 = 0.0                    # avance de la presentación
         self._kb_timer = QTimer(self)           # zoom lento del modo cine
@@ -772,6 +773,7 @@ class ViewerWindow(QDialog):
         self._vault.set_thumb(self._entry.id,
                               self._qimage_jpeg(img, max_side=512, quality=85))
         self.content_added = True
+        self.thumbs_changed.add(self._entry.id)   # que la galería la re-lea
         self._osd("🖼 Este fotograma es ahora la miniatura del video")
 
     def _export_clip(self):

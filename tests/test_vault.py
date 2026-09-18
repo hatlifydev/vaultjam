@@ -415,6 +415,20 @@ def test_filter_params_roundtrip():
     assert FilterParams.from_dict(None).neutral()
 
 
+def test_neutral_filters_do_not_touch_pixels():
+    """Garantía: con los controles por defecto, la imagen NO se altera —
+    apply_filters devuelve el MISMO objeto, sin copia ni procesado."""
+    from PySide6.QtGui import QImage
+
+    from vaultjam.ui.filters import FilterParams, apply_filters
+    img = QImage(20, 20, QImage.Format.Format_RGB32)
+    img.fill(0xFF345678)
+    assert FilterParams().neutral()
+    assert apply_filters(img, FilterParams()) is img
+    # y cualquier control movido deja de ser neutro (sí procesa)
+    assert apply_filters(img, FilterParams(brightness=1)) is not img
+
+
 def test_pin_curtain(tmp_path, vault):
     assert not vault.has_pin
     with pytest.raises(VaultError):

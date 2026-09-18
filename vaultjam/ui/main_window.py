@@ -795,7 +795,9 @@ class MainWindow(QMainWindow):
             return
         if getattr(dlg, "content_added", False):
             # El visor añadió contenido (📸 fotograma) o cambió una
-            # miniatura (🖼): recarga completa para verlo.
+            # miniatura (🖼): invalidar las cacheadas y recargar.
+            for eid in getattr(dlg, "thumbs_changed", ()):
+                self._gallery.invalidate_thumb(eid)
             self._reload_sidebar()
         else:
             # Solo metadata (⭐, ajustes…): refresco ligero sin re-descifrar.

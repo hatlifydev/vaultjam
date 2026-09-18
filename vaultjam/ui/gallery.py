@@ -110,6 +110,8 @@ class GalleryWidget(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self._view)
         self._masters: dict[str, QPixmap] = {}   # miniaturas a resolución completa
+        self._loaded: set[str] = set()           # ids con miniatura REAL ya
+                                                 # descifrada (no placeholder)
         self._base = 160                         # tamaño base del slider
         # Disponibilidad remota por elemento (subidas a Drive en curso):
         # True = todos sus chunks presentes (marco verde), False = aún
@@ -174,8 +176,8 @@ class GalleryWidget(QWidget):
             # aún le faltan chunks. Fino (2 px), que no tape la miniatura.
             pm = QPixmap(pm)   # copia propia antes de pintar encima
             p = QPainter(pm)
-            p.setPen(QPen(QColor("#27ae60") if state else QColor("#e74c3c"), 2))
-            p.drawRect(pm.rect().adjusted(1, 1, -1, -1))
+            p.setPen(QPen(QColor("#27ae60") if state else QColor("#e74c3c"), 1))
+            p.drawRect(pm.rect().adjusted(0, 0, -1, -1))
             p.end()
         item.setIcon(pm)
         item.setSizeHint(QSize(target + 24, target + 46))
@@ -219,9 +221,20 @@ class GalleryWidget(QWidget):
     def load(self, vault: Vault, folder: str | None = None, favorites: bool = False):
         """folder=None muestra todo; "" solo lo sin carpeta; favorites=True
         solo los marcados con ⭐ (ignora la carpeta)."""
-        avail = self._avail          # la disponibilidad remota sobrevive a
-        self.clear_secure()          # las recargas (solo se borra al bloquear)
+        # La disponibilidad Y las miniaturas ya descifradas sobreviven a las
+        # recargas (cambiar de carpeta no re-descifra ni re-descarga nada;
+        # solo el bloqueo purga de verdad). Un mismo archivo carga su thumb
+        # UNA vez, se mire desde «Todo» o desde su carpeta.
+        # OJO: intercambiar ANTES de limpiar — clear_secure() vacía los
+        # contenedores en sitio, y una referencia capturada al mismo objeto
+        # quedaría vacía también.
+        avail = self._avail
+        masters, self._masters = self._masters, {}
+        loaded, self._loaded = self._loaded, set()
+        self.clear_secure()
         self._avail = avail
+        self._masters = masters
+        self._loaded = loaded
         self._vault = vault
         entries = vault.entries(None if favorites else folder, favorites=favorites)
         for e in entries:
@@ -239,10 +252,13 @@ class GalleryWidget(QWidget):
             item.setData(e.thumb_rotation, Qt.ItemDataRole.UserRole + 2)
             item.setData(e.thumb_scale, Qt.ItemDataRole.UserRole + 3)
             item.setToolTip("" if self._privacy else e.name)
-            self._masters[e.id] = _placeholder(e.mime)
+            if e.id not in self._loaded:
+                self._masters[e.id] = _placeholder(e.mime)
             self._model.appendRow(item)
             self._apply_pixmap(item)
-        self._loader = _ThumbLoader(vault, [e.id for e in entries], self)
+        # El cargador solo descifra lo que aún no está en caché.
+        pending = [e.id for e in entries if e.id not in self._loaded]
+        self._loader = _ThumbLoader(vault, pending, self)
         self._loader.thumbReady.connect(self._on_thumb)
         self._loader.start()
 
@@ -254,6 +270,7 @@ class GalleryWidget(QWidget):
                 # y ▶ se aplican en _apply_pixmap. Así los cambios de
                 # metadata jamás requieren volver a descifrar la miniatura.
                 self._masters[entry_id] = QPixmap.fromImage(img)
+                self._loaded.add(entry_id)
                 self._apply_pixmap(item)
                 break
 
@@ -305,5 +322,12 @@ class GalleryWidget(QWidget):
             self._loader = None
         self._model.clear()
         self._masters.clear()   # soltar los pixmaps descifrados
+        self._loaded.clear()
         self._avail = {}
         self._vault = None
+
+    def invalidate_thumb(self, entry_id: str):
+        """Olvida la miniatura cacheada de un elemento (p.ej. tras «usar
+        este fotograma como miniatura»): la próxima carga la re-descifra."""
+        self._masters.pop(entry_id, None)
+        self._loaded.discard(entry_id)

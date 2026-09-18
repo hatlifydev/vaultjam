@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import QPointF, QRect, Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, Qt, QTimer, Signal
 from PySide6.QtGui import (QColor, QImage, QPainter, QPainterPath, QPen,
-                           QPixmap, QTransform)
+                           QPixmap)
 from PySide6.QtWidgets import (
     QCheckBox, QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QWidget,
 )
@@ -253,17 +253,6 @@ class MediaCanvas(QWidget):
                 s * (-1 if self._flip_v else 1))
         p.translate(-iw / 2, -ih / 2)
 
-    def _view_transform(self, iw: int, ih: int) -> QTransform:
-        s = self._view_scale(iw, ih)
-        t = QTransform()
-        t.translate(self.width() / 2 + self._pan.x(),
-                    self.height() / 2 + self._pan.y())
-        t.rotate(self._rotation)
-        t.scale(s * (-1 if self._flip_h else 1),
-                s * (-1 if self._flip_v else 1))
-        t.translate(-iw / 2, -ih / 2)
-        return t
-
     def paintEvent(self, ev):
         p = QPainter(self)
         p.fillRect(self.rect(), QColor(0, 0, 0))
@@ -275,11 +264,15 @@ class MediaCanvas(QWidget):
         # «Antes/después»: el original salta los filtros de color, pero
         # conserva rotación/espejo/zoom para comparar en contexto.
         img = self._src if self._show_original else self._fx
-        # Suavizar: interpolación bilineal; desactivado: vecino más próximo
-        # (con zoom se ven los píxeles reales, útil para inspección).
-        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self._params.smooth)
-
         iw, ih = img.width(), img.height()
+        # Garantía de neutralidad: con los controles por defecto la imagen
+        # no se altera. Al REDUCIR (encajar en ventana) siempre se
+        # interpola —vecino-más-próximo al encoger degrada visiblemente—;
+        # el interruptor «Suavizar» solo decide al AMPLIAR (zoom), que es
+        # donde "ver los píxeles reales" tiene sentido.
+        s = self._view_scale(iw, ih)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform,
+                        self._params.smooth or s < 0.999)
         p.save()
         self._apply_view_ops(p, iw, ih)
         p.drawImage(0, 0, img)
@@ -303,26 +296,6 @@ class MediaCanvas(QWidget):
             p.setPen(QPen(QColor(255, 255, 255, 210), 2))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(cur, LOUPE_RADIUS, LOUPE_RADIUS)
-
-        # ---- mini-mapa cuando hay zoom: dónde estás dentro de la imagen
-        if self._zoom > 1.01:
-            mw = max(80, min(160, self.width() // 5))
-            mh = max(24, int(mw * ih / max(1, iw)))
-            mx, my = self.width() - mw - 10, 10
-            p.setOpacity(0.85)
-            p.drawImage(QRect(mx, my, mw, mh), img)
-            p.setOpacity(1.0)
-            p.setPen(QPen(QColor(255, 255, 255, 160), 1))
-            p.drawRect(mx, my, mw, mh)
-            inv, ok = self._view_transform(iw, ih).inverted()
-            if ok:
-                vis = inv.mapRect(QRect(0, 0, self.width(), self.height()))
-                vis = vis.intersected(QRect(0, 0, iw, ih))
-                if not vis.isEmpty():
-                    p.setPen(QPen(QColor(255, 80, 80), 2))
-                    p.drawRect(mx + vis.x() * mw // iw, my + vis.y() * mh // ih,
-                               max(4, vis.width() * mw // iw),
-                               max(4, vis.height() * mh // ih))
 
         # ---- fundido del modo cine (instantánea previa desvaneciéndose)
         if self._fade_pix is not None:

@@ -50,8 +50,8 @@ viven dentro de un índice cifrado; en disco solo se ven blobs idénticos de
   keyframes). `⌫` deshace el último salto (barra o marcador); las muescas
   de la barra muestran el nombre del marcador al pasar el ratón.
 - Inspección: lupa 3× (`U` o botón central del ratón), «antes/después»
-  manteniendo `O`, alternar ajustar↔100 % con `C`, mini-mapa de posición al
-  hacer zoom, e información del elemento con `I`. Espejo ⇋/⇵ y TODOS los
+  manteniendo `O`, alternar ajustar↔100 % con `C`, e información del
+  elemento con `I`. Espejo ⇋/⇵ y TODOS los
   ajustes de imagen se recuerdan por elemento (índice cifrado; el original
   no se toca).
 - Presentación de cine: `P` cicla normal → aleatoria → parar, con fundido
