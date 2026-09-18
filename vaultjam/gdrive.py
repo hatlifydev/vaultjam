@@ -84,9 +84,14 @@ def get_credentials(client_secret_path: str, readonly: bool = True):
 
 
 def build_service(creds):
-    """Un cliente de la API por hilo (httplib2 no es thread-safe)."""
+    """Un cliente de la API por hilo (httplib2 no es thread-safe).
+
+    static_discovery=True usa el documento de descubrimiento EMPAQUETADO:
+    sin él, cada cliente nuevo (cada hilo de descarga) haría una petición
+    de red para descargarlo, ralentizando el primer acceso de cada hilo."""
     from googleapiclient.discovery import build
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+    return build("drive", "v3", credentials=creds,
+                 cache_discovery=False, static_discovery=True)
 
 
 def get_service(client_secret_path: str, readonly: bool = True):
@@ -127,10 +132,18 @@ class _PriorityGate:
             if self._fg <= 0:
                 self._cv.notify_all()
 
-    def wait_for_fg_idle(self):
+    def wait_for_fg_idle(self, max_wait: float = 2.5):
+        """Cede el paso al primer plano, pero NUNCA se bloquea para siempre:
+        pasado max_wait, la lectura de fondo avanza igual (evita que una
+        miniatura quede colgada si algo de primer plano no cierra bien)."""
+        import time as _t
+        deadline = _t.monotonic() + max_wait
         with self._cv:
             while self._fg > 0:
-                self._cv.wait(0.5)
+                remaining = deadline - _t.monotonic()
+                if remaining <= 0:
+                    return
+                self._cv.wait(min(0.25, remaining))
 
 
 class DriveStore:

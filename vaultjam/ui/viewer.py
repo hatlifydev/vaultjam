@@ -1459,6 +1459,12 @@ class ViewerWindow(QDialog):
         self._buffer_timer.stop()
         self._stream_reader = None
         self._pos.set_buffered([])
+        # Cortar las pre-cargas pendientes del video que se cierra: si no,
+        # sus descargas siguen en cola con prioridad de primer plano y
+        # dejan sin turno a las miniaturas de la galería (carpetas lentas).
+        cancel = getattr(self._vault.store, "cancel_prefetch", None)
+        if cancel is not None:
+            cancel()
         self._player.stop()
         self._player.setSource(QUrl())  # desengancha el QIODevice del backend
         if self._device is not None:
