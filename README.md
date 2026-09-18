@@ -76,7 +76,15 @@ viven dentro de un índice cifrado; en disco solo se ven blobs idénticos de
   capturas, grabación de pantalla, pantalla compartida y Windows Recall
   (`SetWindowDisplayAffinity`, Windows 10 2004+).
 - Exportar (descifrar a disco) solo bajo acción explícita, con advertencia.
-- Bloqueo manual y automático por inactividad (1/5/15/30 min).
+- Bloqueo manual y automático por inactividad (1/5/15/30 min). La cuenta
+  atrás se suspende sola mientras hay una importación o una sincronización
+  a Drive en curso, y se rearma al terminar.
+- Cortina 🙈 con PIN de 4 dígitos: oculta miniaturas y nombres e impide
+  abrir o exportar, SIN bloquear la bóveda (ideal mientras corre una
+  sincronización). «👁 Mostrar» pide el PIN; el botón «PIN…» lo crea o lo
+  cambia (pidiendo el actual). El PIN se guarda hasheado dentro del índice
+  cifrado — es una cortina contra miradas, no criptografía: quien tenga la
+  contraseña de la bóveda no lo necesita.
 
 ## Ejecutar en desarrollo
 

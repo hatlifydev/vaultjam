@@ -12,7 +12,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QInputDialog, QLabel, QListWidget,
+    QComboBox, QFileDialog, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressDialog,
     QSlider, QSplitter, QToolBar, QWidget,
 )
@@ -214,6 +214,16 @@ class MainWindow(QMainWindow):
             "grabación y Recall (Windows 10 2004+)."
         )
         self._act_protect.toggled.connect(self._apply_capture_protection)
+        # Cortina 🙈 con PIN: oculta miniaturas y nombres e impide abrir,
+        # sin bloquear la bóveda (una sincronización sigue corriendo).
+        self._privacy = False
+        self._act_privacy = tb.addAction("🙈 Ocultar", self._toggle_privacy)
+        self._act_privacy.setToolTip(
+            "Ocultar el contenido en pantalla (miniaturas, nombres y visor) "
+            "sin bloquear la bóveda. Para mostrar de nuevo pide el PIN.")
+        self._act_pin = tb.addAction("PIN…", self._change_pin)
+        self._act_pin.setToolTip("Crear o cambiar el PIN de la cortina "
+                                 "(cambiarlo pide el PIN actual)")
         tb.addSeparator()
         tb.addAction("🔒 Bloquear ahora", self.lock_now)
         set_capture_protection(self, True)
@@ -486,7 +496,81 @@ class MainWindow(QMainWindow):
         for v in self._viewers:
             set_capture_protection(v, on)
 
+    # ---------------- cortina con PIN ----------------
+
+    def _ask_pin(self, title: str, label: str) -> str | None:
+        while True:
+            txt, ok = QInputDialog.getText(
+                self, title, label, QLineEdit.EchoMode.Password)
+            if not ok:
+                return None
+            if txt.isdigit() and len(txt) == 4:
+                return txt
+            QMessageBox.warning(self, title, "El PIN debe ser de 4 dígitos.")
+
+    def _toggle_privacy(self):
+        if not self._privacy:
+            if not self._vault.has_pin:
+                p1 = self._ask_pin("Crear PIN", "Nuevo PIN (4 dígitos):")
+                if p1 is None:
+                    return
+                p2 = self._ask_pin("Crear PIN", "Repite el PIN:")
+                if p2 != p1:
+                    QMessageBox.warning(self, "Crear PIN", "Los PIN no coinciden.")
+                    return
+                self._vault.set_pin(None, p1)
+                if self._vault.read_only:
+                    QMessageBox.information(
+                        self, "PIN", "Bóveda remota: el PIN vale solo para "
+                        "esta sesión (no se escribe nada en Drive).")
+            # activar la cortina: cerrar visores y ocultar todo
+            self._privacy = True
+            for v in list(self._viewers):
+                v.close()
+            self._viewers.clear()
+            self._gallery.set_privacy(True)
+            self._act_export.setEnabled(False)
+            self._act_delete.setEnabled(False)
+            self._act_privacy.setText("👁 Mostrar")
+            self.statusBar().showMessage("Contenido oculto 🙈 — 👁 Mostrar pide el PIN")
+        else:
+            pin = self._ask_pin("Mostrar contenido", "PIN:")
+            if pin is None:
+                return
+            if not self._vault.check_pin(pin):
+                QMessageBox.warning(self, "Mostrar contenido", "PIN incorrecto.")
+                return
+            self._privacy = False
+            self._gallery.set_privacy(False)
+            self._gallery.refresh_meta(self._vault)   # restaura nombres/estrellas
+            self._act_export.setEnabled(True)
+            self._act_delete.setEnabled(not self._vault.read_only)
+            self._act_privacy.setText("🙈 Ocultar")
+            self._update_status()
+
+    def _change_pin(self):
+        old = None
+        if self._vault.has_pin:
+            old = self._ask_pin("Cambiar PIN", "PIN actual:")
+            if old is None:
+                return
+            if not self._vault.check_pin(old):
+                QMessageBox.warning(self, "Cambiar PIN", "El PIN actual no es correcto.")
+                return
+        p1 = self._ask_pin("Cambiar PIN", "Nuevo PIN (4 dígitos):")
+        if p1 is None:
+            return
+        p2 = self._ask_pin("Cambiar PIN", "Repite el nuevo PIN:")
+        if p2 != p1:
+            QMessageBox.warning(self, "Cambiar PIN", "Los PIN no coinciden.")
+            return
+        self._vault.set_pin(old, p1)
+        note = (" (solo esta sesión: bóveda remota)" if self._vault.read_only else "")
+        QMessageBox.information(self, "PIN", f"PIN actualizado{note}.")
+
     def _open_entry(self, entry_id: str):
+        if self._privacy:
+            return   # con la cortina activa no se abre nada
         # La lista de reproducción es lo que se ve en la galería (respeta la
         # carpeta activa y su orden), mezclando fotos y videos.
         dlg = open_viewer(self._vault, entry_id, self,

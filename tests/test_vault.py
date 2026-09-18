@@ -362,6 +362,35 @@ def test_remote_readonly_streaming_and_guards(tmp_path, vault):
     assert rv.get(ev.id).resume_ms == 0
 
 
+def test_pin_curtain(tmp_path, vault):
+    assert not vault.has_pin
+    with pytest.raises(VaultError):
+        vault.set_pin(None, "12a4")     # debe ser numérico
+    with pytest.raises(VaultError):
+        vault.set_pin(None, "12345")    # y de 4 dígitos exactos
+    vault.set_pin(None, "1234")
+    assert vault.has_pin
+    assert vault.check_pin("1234") and not vault.check_pin("0000")
+    with pytest.raises(VaultError):
+        vault.set_pin("9999", "5678")   # cambiar exige el PIN antiguo
+    vault.set_pin("1234", "5678")
+    assert vault.check_pin("5678") and not vault.check_pin("1234")
+
+    # persiste dentro del índice cifrado (nunca en claro: se guarda hasheado)
+    vault.lock()
+    v2 = Vault.open(tmp_path / "v.vault", PW)
+    assert v2.has_pin and v2.check_pin("5678")
+
+    # bóveda remota: el PIN llega con el índice y los cambios son de sesión
+    store = _FakeRemoteStore(tmp_path / "v.vault")
+    rv = Vault.open_remote(store, PW)
+    assert rv.has_pin and rv.check_pin("5678")
+    rv.set_pin("5678", "1111")          # permitido, pero no persiste en disco
+    assert rv.check_pin("1111")
+    rv2 = Vault.open_remote(store, PW)
+    assert rv2.check_pin("5678")        # el remoto sigue con el original
+
+
 def test_folder_validation(tmp_path, vault):
     with pytest.raises(VaultError):
         vault.create_folder("con/barra")

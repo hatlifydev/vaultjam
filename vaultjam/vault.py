@@ -15,6 +15,7 @@ La capa de UI solo habla con la clase Vault; nunca toca claves ni AEADs.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -84,6 +85,7 @@ class Vault:
         self._keys: cc.SubKeys | None = None
         self._entries: dict[str, FileEntry] = {}
         self._folders: list[str] = []
+        self._pin: str | None = None   # "salt_hex:sha256_hex" del PIN de cortina
         # Un solo lock serializa las mutaciones de índice/almacén; los
         # descifrados de lectura son seguros en paralelo (AESGCM no tiene
         # estado y cada lector usa su propia caché).
@@ -197,6 +199,7 @@ class Vault:
             self._mk = None
             self._keys = None       # los AEAD liberan sus claves en OpenSSL
             self._entries = {}
+            self._pin = None
 
     def change_password(self, old: str, new: str, params: dict | None = None) -> None:
         """Cambiar contraseña = re-envolver 32 bytes. No se recifra contenido."""
@@ -254,7 +257,8 @@ class Vault:
         # no existe ninguna estructura de directorios que las refleje.
         js = json.dumps(
             {"files": [e.__dict__ for e in self._entries.values()],
-             "folders": self._folders}
+             "folders": self._folders,
+             "pin": self._pin}
         ).encode()
         # Padding a la siguiente potencia de 2 (mínimo 4 KiB): el tamaño de
         # index.enc solo revela un orden de magnitud logarítmico de la
@@ -277,6 +281,7 @@ class Vault:
         self._entries = {d["id"]: FileEntry(**d) for d in data["files"]}
         # .get: compatibilidad con bóvedas creadas antes de las carpetas.
         self._folders = list(data.get("folders", []))
+        self._pin = data.get("pin")
         # Migración: los marcadores fueron enteros (ms), luego pares
         # [ms, etiqueta] y ahora tríos [ms, etiqueta, rotación|null].
         # Normalizar cualquier formato antiguo al cargar.
@@ -501,6 +506,36 @@ class Vault:
 
     def open_reader(self, entry_id: str) -> "ChunkReader":
         return ChunkReader(self, self._entries[entry_id])
+
+    # ---- PIN de cortina (ocultar/mostrar contenido en pantalla) ----
+    #
+    # NO es criptografía: es una cortina de cortesía contra miradas ajenas
+    # con la bóveda ABIERTA (p.ej. durante una sincronización larga). Quien
+    # tenga la contraseña de la bóveda lo esquiva por definición. Se guarda
+    # como hash con salt dentro del índice cifrado; en bóvedas remotas
+    # (solo lectura) el cambio vive solo durante la sesión.
+
+    @property
+    def has_pin(self) -> bool:
+        return self._pin is not None
+
+    def check_pin(self, pin: str) -> bool:
+        if self._pin is None:
+            return False
+        salt_hex, h = self._pin.split(":", 1)
+        return hashlib.sha256(bytes.fromhex(salt_hex) + pin.encode()).hexdigest() == h
+
+    def set_pin(self, old: str | None, new: str) -> None:
+        """Crea o cambia el PIN; cambiar exige el PIN anterior."""
+        if self._pin is not None and not self.check_pin(old or ""):
+            raise VaultError("El PIN actual no es correcto.")
+        if not (new.isdigit() and len(new) == 4):
+            raise VaultError("El PIN debe ser exactamente 4 dígitos.")
+        salt = cc.random_bytes(16)
+        digest = hashlib.sha256(salt + new.encode()).hexdigest()
+        with self._lock:
+            self._pin = f"{salt.hex()}:{digest}"
+            self._save_index()   # remota: no-op -> PIN solo de esta sesión
 
     def all_blob_ids(self) -> list[str]:
         """Todos los blobs que referencia el índice (chunks + miniaturas),

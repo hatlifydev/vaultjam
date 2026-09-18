@@ -115,6 +115,7 @@ class GalleryWidget(QWidget):
         # True = todos sus chunks presentes (marco verde), False = aún
         # incompleto (marco rojo), ausente = sin información (sin marco).
         self._avail: dict[str, bool] = {}
+        self._privacy = False    # cortina 🙈: iconos y nombres ocultos
         self.set_zoom(160)
 
     # ------------------------------------------------------------------
@@ -135,6 +136,23 @@ class GalleryWidget(QWidget):
         La rotación de miniatura y el distintivo ▶ se aplican aquí, al
         vuelo: girar o redimensionar una miniatura NUNCA re-descifra nada
         (el master decodificado se reutiliza tal cual)."""
+        scale0 = item.data(Qt.ItemDataRole.UserRole + 3) or 1.0
+        if self._privacy:
+            # Cortina activa: losa neutra idéntica para todos, sin pista
+            # alguna del contenido (ni imagen, ni proporciones).
+            target = max(48, int(self._base * scale0))
+            pm = QPixmap(target, target)
+            pm.fill(QColor("#3c3c3c"))
+            p = QPainter(pm)
+            p.setPen(QColor("#777"))
+            f = p.font()
+            f.setPointSize(max(10, target // 5))
+            p.setFont(f)
+            p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "🙈")
+            p.end()
+            item.setIcon(pm)
+            item.setSizeHint(QSize(target + 24, target + 46))
+            return
         master = self._masters.get(item.data(Qt.ItemDataRole.UserRole))
         if master is None:
             return
@@ -162,6 +180,17 @@ class GalleryWidget(QWidget):
         item.setIcon(pm)
         item.setSizeHint(QSize(target + 24, target + 46))
 
+    def set_privacy(self, on: bool):
+        """Cortina 🙈: oculta miniaturas y nombres sin descartar nada (los
+        masters siguen en RAM; al mostrar, refresh_meta restaura textos)."""
+        self._privacy = on
+        for row in range(self._model.rowCount()):
+            item = self._model.item(row)
+            if on:
+                item.setText("•••")
+                item.setToolTip("")
+            self._apply_pixmap(item)
+
     def set_availability(self, status: dict[str, bool]):
         """Aplica (y recuerda para futuras recargas) la disponibilidad
         remota de cada elemento, repintando los marcos en sitio."""
@@ -173,6 +202,8 @@ class GalleryWidget(QWidget):
         """Sincroniza EN SITIO lo que pudo cambiar (⭐, rotación y tamaño de
         miniatura) sin re-descifrar: reutiliza los masters ya decodificados.
         Es lo que corre al cerrar un visor, en vez de recargar todo."""
+        if self._privacy:
+            return   # con la cortina activa no se restauran nombres
         for row in range(self._model.rowCount()):
             item = self._model.item(row)
             try:
@@ -180,6 +211,7 @@ class GalleryWidget(QWidget):
             except KeyError:
                 continue
             item.setText(("⭐ " + e.name) if e.favorite else e.name)
+            item.setToolTip(e.name)
             item.setData(e.thumb_rotation, Qt.ItemDataRole.UserRole + 2)
             item.setData(e.thumb_scale, Qt.ItemDataRole.UserRole + 3)
             self._apply_pixmap(item)
@@ -194,14 +226,19 @@ class GalleryWidget(QWidget):
         entries = vault.entries(None if favorites else folder, favorites=favorites)
         for e in entries:
             item = QStandardItem()
-            item.setText(("⭐ " + e.name) if e.favorite else e.name)
+            # Con la cortina activa, ni siquiera una recarga (cambio de
+            # carpeta) revela los nombres.
+            if self._privacy:
+                item.setText("•••")
+            else:
+                item.setText(("⭐ " + e.name) if e.favorite else e.name)
             item.setData(e.id, Qt.ItemDataRole.UserRole)
             item.setData(e.mime, Qt.ItemDataRole.UserRole + 1)
             # Rotación y escala PROPIAS de la miniatura (independientes de
             # la rotación del contenido en el visor).
             item.setData(e.thumb_rotation, Qt.ItemDataRole.UserRole + 2)
             item.setData(e.thumb_scale, Qt.ItemDataRole.UserRole + 3)
-            item.setToolTip(e.name)
+            item.setToolTip("" if self._privacy else e.name)
             self._masters[e.id] = _placeholder(e.mime)
             self._model.appendRow(item)
             self._apply_pixmap(item)
@@ -225,7 +262,7 @@ class GalleryWidget(QWidget):
 
     def _context_menu(self, pos):
         ids = self.selected_ids()
-        if not ids or self._vault is None:
+        if not ids or self._vault is None or self._privacy:
             return
         if getattr(self._vault, "read_only", False):
             return   # bóveda remota: sin favoritos/rotación/tamaño
