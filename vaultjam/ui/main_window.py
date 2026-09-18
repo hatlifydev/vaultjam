@@ -293,18 +293,19 @@ class MainWindow(QMainWindow):
         self._sync_worker = w = _SyncWorker(
             secret, self._vault.root, self._vault.all_blob_ids(),
             self._vault.root.name, hint, self)
+        self._autolock.stop()   # sin auto-bloqueo mientras se sincroniza
         w.status.connect(prog.setLabelText)
 
         def on_progress(done: int, total: int):
             prog.setRange(0, max(total, 1))
             prog.setValue(done)
-            self._reset_autolock()   # una subida larga cuenta como actividad
 
         w.progress.connect(on_progress)
         prog.canceled.connect(w.cancel)
 
         def done(result):
             self._sync_worker = None
+            self._reset_autolock()   # rearmar la cuenta atrás al terminar
             prog.close()
             if isinstance(result, dict):
                 settings.setValue(key, result["folder_id"])
@@ -464,6 +465,14 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _reset_autolock(self):
+        # Con una sincronización a Drive o una importación en curso, la
+        # cuenta atrás de auto-bloqueo se SUSPENDE: bloquear a mitad
+        # cancelaría horas de subida. Se rearma sola al terminar el trabajo;
+        # el botón de bloqueo manual sigue disponible en todo momento.
+        if (getattr(self, "_sync_worker", None) is not None
+                or self._import_worker is not None):
+            self._autolock.stop()
+            return
         secs = AUTOLOCK_CHOICES[self._autolock_combo.currentIndex()][1]
         self._autolock.start(secs * 1000)
 
@@ -515,6 +524,8 @@ class MainWindow(QMainWindow):
         prog.canceled.connect(w.cancel)
 
         def done(ok: int, errors: list):
+            self._import_worker = None
+            self._reset_autolock()   # rearmar tras la importación
             prog.setValue(prog.maximum())
             self._reload_sidebar()   # recarga contadores, galería y miniaturas
             if errors:
