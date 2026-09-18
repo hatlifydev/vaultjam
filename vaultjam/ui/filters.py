@@ -37,6 +37,27 @@ class FilterParams:
         return not (self.brightness or self.contrast or self.gamma
                     or self.saturation or self.temperature or self.sharpness)
 
+    _FIELDS = ("brightness", "contrast", "gamma", "saturation",
+               "temperature", "sharpness", "smooth")
+
+    def to_dict(self) -> dict:
+        """Solo los valores no neutros (dict vacío = todo en neutro), para
+        persistir por elemento dentro del índice cifrado."""
+        out = {}
+        for k in self._FIELDS:
+            v = getattr(self, k)
+            if v not in (0, False):
+                out[k] = v
+        return out
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "FilterParams":
+        p = cls()
+        for k in cls._FIELDS:
+            if d and k in d:
+                setattr(p, k, bool(d[k]) if k == "smooth" else int(d[k]))
+        return p
+
 
 def _build_luts(p: FilterParams) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Colapsa contraste -> brillo -> gamma -> temperatura en 3 LUTs uint8."""

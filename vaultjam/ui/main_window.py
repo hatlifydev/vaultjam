@@ -708,10 +708,15 @@ class MainWindow(QMainWindow):
     def _on_viewer_closed(self, dlg):
         if dlg in self._viewers:
             self._viewers.remove(dlg)
-        # El visor solo puede cambiar ⭐ (y metadata que no afecta a las
-        # miniaturas), así que basta el refresco ligero: nada se re-descifra
-        # y las miniaturas no parpadean.
-        self._light_refresh()
+        if self._vault.is_locked:
+            return
+        if getattr(dlg, "content_added", False):
+            # El visor añadió contenido (📸 fotograma) o cambió una
+            # miniatura (🖼): recarga completa para verlo.
+            self._reload_sidebar()
+        else:
+            # Solo metadata (⭐, ajustes…): refresco ligero sin re-descifrar.
+            self._light_refresh()
 
     # ------------------------------------------------------------------
 

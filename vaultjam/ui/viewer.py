@@ -28,7 +28,10 @@ cifrado, en un hilo aparte, con caché LRU en RAM.
 
 from __future__ import annotations
 
+import random
+import time
 from collections import OrderedDict
+from datetime import datetime
 
 from PySide6.QtCore import (
     QBuffer, QByteArray, QEvent, QIODevice, QPoint, Qt, QThread, QTimer, QUrl,
@@ -37,9 +40,9 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QImage, QMovie, QPainter, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaMetaData, QMediaPlayer, QVideoSink
 from PySide6.QtWidgets import (
-    QAbstractButton, QAbstractSlider, QDialog, QHBoxLayout, QInputDialog,
-    QLabel, QMenu, QMessageBox, QPushButton, QSlider, QStyle, QVBoxLayout,
-    QWidget,
+    QAbstractButton, QAbstractSlider, QDialog, QFileDialog, QHBoxLayout,
+    QInputDialog, QLabel, QMenu, QMessageBox, QPushButton, QSlider, QStyle,
+    QToolTip, QVBoxLayout, QWidget,
 )
 
 from ..memio import DecryptingIODevice
@@ -79,7 +82,14 @@ _HELP_HTML = """
 <tr><td><b>L</b> / 🔁</td><td>repetición: este video → todos los videos → apagada</td></tr>
 <tr><td><b>B</b></td><td>repetición A–B (1.º fija A, 2.º fija B, 3.º la quita)</td></tr>
 <tr><td><b>S</b></td><td>⭐ favorito</td></tr>
-<tr><td><b>P</b></td><td>presentación (foto 5 s, video completo)</td></tr>
+<tr><td><b>P</b></td><td>presentación: normal → aleatoria → parar (cine: fundido + zoom lento)</td></tr>
+<tr><td><b>⌫</b></td><td>volver al punto anterior al último salto</td></tr>
+<tr><td><b>I</b></td><td>información del elemento</td></tr>
+<tr><td><b>C</b></td><td>alternar ajustar ↔ 100 % (1:1)</td></tr>
+<tr><td><b>U</b> / botón central</td><td>lupa 3× siguiendo el cursor</td></tr>
+<tr><td><b>O</b> (mantener)</td><td>ver el original sin ajustes (antes/después)</td></tr>
+<tr><td>⇋ ⇵</td><td>espejo horizontal/vertical (se recuerda)</td></tr>
+<tr><td>📸 / 🖼 / ✂</td><td>fotograma → foto cifrada · miniatura · exportar tramo A–B</td></tr>
 <tr><td><b>H</b> / <b>?</b></td><td>esta ayuda</td></tr>
 </table></div>
 """
@@ -99,12 +109,12 @@ class _SeekSlider(QSlider):
 
     def __init__(self):
         super().__init__(Qt.Orientation.Horizontal)
-        self._marks: list[tuple[int, bool]] = []   # (ms, ¿tiene rotación?)
+        self._marks: list[tuple[int, bool, str]] = []  # (ms, ¿rotación?, nombre)
         self._ab: tuple[int, int] | None = None
         self.setMouseTracking(True)
 
-    def set_marks(self, marks: list[tuple[int, bool]]):
-        self._marks = [(int(t), bool(r)) for t, r in marks]
+    def set_marks(self, marks: list[tuple[int, bool, str]]):
+        self._marks = [(int(t), bool(r), str(lbl)) for t, r, lbl in marks]
         self.update()
 
     def set_ab(self, a: int | None, b: int | None):
@@ -125,8 +135,15 @@ class _SeekSlider(QSlider):
 
     def mouseMoveEvent(self, ev):
         if self.maximum() > self.minimum():
-            self.hoverMoved.emit(self._val_at(ev.position().x()),
-                                 round(ev.position().x()))
+            x = ev.position().x()
+            self.hoverMoved.emit(self._val_at(x), round(x))
+            # Tooltip al rozar una muesca: nombre del marcador (o su tiempo).
+            span = self.width() - 8
+            for t, _r, lbl in self._marks:
+                if abs(4 + t / self.maximum() * span - x) <= 6:
+                    QToolTip.showText(ev.globalPosition().toPoint(),
+                                      lbl or f"🔖 {_fmt_ms(t)}", self)
+                    break
         super().mouseMoveEvent(ev)
 
     def leaveEvent(self, ev):
@@ -149,7 +166,7 @@ class _SeekSlider(QSlider):
             # ahí el video se ve girado, hasta el siguiente turquesa).
             pen_plain = QPen(QColor(255, 190, 0), 2)
             pen_rot = QPen(QColor(0, 200, 230), 3)
-            for t, has_rot in self._marks:
+            for t, has_rot, _lbl in self._marks:
                 x = 4 + round(t / self.maximum() * span)
                 p.setPen(pen_rot if has_rot else pen_plain)
                 p.drawLine(x, 2, x, self.height() - 3)
@@ -244,6 +261,66 @@ class _PreviewWorker(QThread):
             self._reader.close()
 
 
+def _export_clip_av(vault: Vault, entry_id: str, a_ms: int, b_ms: int,
+                    dst: str) -> str:
+    """Recorte A–B por REMUX (sin recodificar): copia los paquetes
+    comprimidos tal cual desde el lector cifrado al archivo destino, con
+    corte alineado al keyframe anterior a A. Rápido y sin pérdida."""
+    import av
+    reader = vault.open_reader(entry_id)
+    try:
+        inp = av.open(reader)
+        vstream = inp.streams.video[0]
+        streams = [s for s in inp.streams if s.type in ("video", "audio")]
+        out = av.open(dst, "w")
+        omap = {}
+        for s in streams:
+            try:
+                omap[s.index] = out.add_stream_from_template(s)
+            except AttributeError:   # PyAV antiguos
+                omap[s.index] = out.add_stream(template=s)
+        start, end = a_ms / 1000, b_ms / 1000
+        inp.seek(int(start / vstream.time_base), stream=vstream, backward=True)
+        offsets: dict[int, int] = {}
+        for pkt in inp.demux(streams):
+            if pkt.dts is None or pkt.stream.index not in omap:
+                continue
+            ref = pkt.pts if pkt.pts is not None else pkt.dts
+            t = float(ref * pkt.time_base)
+            if pkt.stream.type == "video":
+                if t > end:
+                    break                      # el video manda el final
+            elif t < start - 0.2 or t > end:
+                continue                       # audio fuera del tramo
+            si = pkt.stream.index
+            if si not in offsets:
+                offsets[si] = pkt.dts          # re-basar tiempos a ~0
+            pkt.pts = None if pkt.pts is None else pkt.pts - offsets[si]
+            pkt.dts = pkt.dts - offsets[si]
+            pkt.stream = omap[si]
+            out.mux(pkt)
+        out.close()
+        inp.close()
+    finally:
+        reader.close()
+    return dst
+
+
+class _ClipWorker(QThread):
+    done = Signal(object)   # ruta str | Exception
+
+    def __init__(self, vault: Vault, entry_id: str, a_ms: int, b_ms: int,
+                 dst: str, parent=None):
+        super().__init__(parent)
+        self._args = (vault, entry_id, a_ms, b_ms, dst)
+
+    def run(self):
+        try:
+            self.done.emit(_export_clip_av(*self._args))
+        except Exception as e:  # noqa: BLE001
+            self.done.emit(e)
+
+
 class ViewerWindow(QDialog):
     def __init__(self, vault: Vault, entry_id: str,
                  playlist: list[str] | None = None, parent=None):
@@ -266,6 +343,7 @@ class ViewerWindow(QDialog):
         self._canvas = MediaCanvas()
         self._canvas.doubleClicked.connect(self.toggle_fullscreen)
         self._canvas.rotationChanged.connect(self._on_rotation)
+        self._canvas.flipChanged.connect(self._on_flip)
         self._sink = QVideoSink(self)
         self._sink.videoFrameChanged.connect(self._on_frame)
         self._player.setVideoSink(self._sink)
@@ -286,6 +364,14 @@ class ViewerWindow(QDialog):
         # encadena videos, y resetearlo en cada cambio lo rompería.
         self._repeat = "off"
         self._ab: list[int] = []                # [] | [a] | [a, b]
+        self._jump_stack: list[int] = []        # posiciones para «volver» (⌫)
+        self._clip_worker: _ClipWorker | None = None
+        self.content_added = False              # la ventana principal recarga
+        self._advance_fade = False              # el próximo cambio viene del
+        self._slide_t0 = 0.0                    # avance de la presentación
+        self._kb_timer = QTimer(self)           # zoom lento del modo cine
+        self._kb_timer.setInterval(80)
+        self._kb_timer.timeout.connect(self._kb_tick)
         # Última rotación aplicada por los SEGMENTOS de marcadores (un
         # marcador con rotación define "de aquí en adelante" hasta el
         # siguiente marcador con rotación).
@@ -299,7 +385,7 @@ class ViewerWindow(QDialog):
         self._btn_play.setFixedWidth(44)
         self._btn_play.clicked.connect(self._toggle)
         self._pos = _SeekSlider()
-        self._pos.sliderMoved.connect(self._player.setPosition)
+        self._pos.sliderMoved.connect(self._on_slider_jump)
         self._pos.hoverMoved.connect(self._on_seek_hover)
         self._pos.hoverLeft.connect(lambda: self._preview.hide())
         self._time = QLabel("0:00 / 0:00")
@@ -350,6 +436,23 @@ class ViewerWindow(QDialog):
         btn_mark.setToolTip("Añadir marcador en la posición actual (tecla M)")
         btn_mark.clicked.connect(self._add_mark)
 
+        btn_shot = QPushButton("📸")
+        btn_shot.setFixedWidth(34)
+        btn_shot.setToolTip("Guardar este fotograma como FOTO CIFRADA dentro "
+                            "de la bóveda (nunca toca el disco en claro)")
+        btn_shot.clicked.connect(self._capture_frame)
+
+        btn_sthumb = QPushButton("🖼")
+        btn_sthumb.setFixedWidth(34)
+        btn_sthumb.setToolTip("Usar este fotograma como miniatura del video")
+        btn_sthumb.clicked.connect(self._frame_as_thumb)
+
+        self._btn_clip = QPushButton("✂")
+        self._btn_clip.setFixedWidth(34)
+        self._btn_clip.setToolTip("Exportar el tramo A–B como video "
+                                  "(descifrado, sin recodificar)")
+        self._btn_clip.clicked.connect(self._export_clip)
+
         btn_fs = QPushButton("⛶")
         btn_fs.setFixedWidth(34)
         btn_fs.setToolTip("Pantalla completa (tecla F; Esc para salir)")
@@ -362,7 +465,8 @@ class ViewerWindow(QDialog):
         vbar.addWidget(self._pos, 1)
         vbar.addWidget(self._time)
         for w in (btn_slower, self._rate_lbl, btn_faster, self._btn_repeat,
-                  btn_mark, self._btn_mute, self._vol, btn_fs):
+                  btn_mark, btn_shot, btn_sthumb, self._btn_clip,
+                  self._btn_mute, self._vol, btn_fs):
             vbar.addWidget(w)
         self._video_bar = QWidget()
         self._video_bar.setLayout(vbar)
@@ -412,6 +516,12 @@ class ViewerWindow(QDialog):
             "QLabel { background: rgba(10,10,10,225); color: #ddd;"
             " padding: 18px 26px; border-radius: 12px; }")
         self._help_lbl.hide()
+
+        self._info_lbl = QLabel("", self._canvas)
+        self._info_lbl.setStyleSheet(
+            "QLabel { background: rgba(10,10,10,215); color: #ddd;"
+            " padding: 10px 14px; border-radius: 10px; font-size: 13px; }")
+        self._info_lbl.hide()
 
         self._preview = _PreviewPopup(self)
         self._preview_worker: _PreviewWorker | None = None
@@ -475,24 +585,36 @@ class ViewerWindow(QDialog):
 
     def _load_current(self):
         self._loading = True
+        fade_on = self._advance_fade      # ¿venimos de un avance de cine?
+        self._advance_fade = False
         self._save_resume()          # posición del elemento saliente
+        self._save_adjust()          # y sus ajustes de imagen, si cambiaron
         self._teardown_source()
         self._teardown_movie()
         self._stop_preview()
         self._ab = []                    # A-B es por posición: no sobrevive
         self._pos.set_ab(None, None)     # (la repetición 🔁 sí se mantiene)
         self._auto_rot = None            # los segmentos se recalculan
+        self._jump_stack.clear()
         self._slide_timer.stop()
+        self._kb_timer.stop()
+        self._info_lbl.hide()
 
         self._entry = e = self._vault.get(self._playlist[self._idx])
         self._update_title()
-        # Vista y filtros neutros por elemento; la rotación persistida se
-        # restaura sin re-guardarse (flag _loading).
+        # Vista y filtros neutros por elemento; rotación, espejo y ajustes
+        # persistidos se restauran sin re-guardarse (flag _loading).
         self._canvas.reset_view()
         self._adjust.reset_sliders()
         if e.rotation:
             self._canvas.set_rotation(e.rotation)
-        self._canvas.set_image(QImage())
+        if e.flip_h or e.flip_v:
+            self._canvas.set_flip(e.flip_h, e.flip_v)
+        if e.adjust:
+            self._canvas.apply_params(e.adjust)
+            self._adjust.sync_from_canvas()
+        if not fade_on:
+            self._canvas.set_image(QImage())
 
         multiple = len(self._playlist) > 1
         self._nav_prev.setVisible(multiple)
@@ -526,10 +648,11 @@ class ViewerWindow(QDialog):
                 if img.isNull():
                     QMessageBox.warning(self, "Visor", "No se pudo decodificar la imagen.")
                 else:
-                    self._canvas.set_image(img)
+                    # Modo cine: fundido suave al llegar por avance automático.
+                    self._canvas.set_image(img, fade_ms=400 if fade_on else 0)
             del data
             if self._slideshow:
-                self._slide_timer.start(SLIDESHOW_MS)
+                self._start_slide_timers()
 
         # En ventana: controles siempre visibles. En pantalla completa:
         # ocultos hasta que el ratón baje a la franja inferior.
@@ -582,6 +705,152 @@ class ViewerWindow(QDialog):
             return
         self._vault.set_rotation(self._entry.id, rot)
         self._osd(f"↻ {rot}°")
+
+    def _on_flip(self, fh: bool, fv: bool):
+        if self._loading:
+            return
+        self._vault.set_flip(self._entry.id, fh, fv)
+        estado = ("horizontal" if fh else "") + (" vertical" if fv else "")
+        self._osd(f"⇋ Espejo {estado.strip()}" if (fh or fv) else "Espejo desactivado")
+
+    def _save_adjust(self):
+        """Persiste los ajustes de imagen del elemento saliente si cambiaron
+        (en el índice cifrado; el archivo original queda intacto)."""
+        try:
+            if not self._vault.is_locked:
+                cur = self._canvas.params_dict()
+                if cur != (self._entry.adjust or {}):
+                    self._vault.set_adjust(self._entry.id, cur)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Captura de fotograma, miniatura, recorte A–B, saltos e info
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _qimage_jpeg(img: QImage, max_side: int | None = None,
+                     quality: int = 92) -> bytes:
+        """QImage -> JPEG en RAM (QBuffer): jamás pasa por el disco."""
+        if max_side:
+            img = img.scaled(max_side, max_side,
+                             Qt.AspectRatioMode.KeepAspectRatio,
+                             Qt.TransformationMode.SmoothTransformation)
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        img.save(buf, "JPG", quality)
+        data = bytes(buf.data())
+        buf.close()
+        return data
+
+    def _current_frame_image(self) -> QImage | None:
+        img = self._canvas._src
+        return None if img is None or img.isNull() else img.copy()
+
+    def _capture_frame(self):
+        if self._entry.mime != "video" or self._read_only_notice():
+            return
+        img = self._current_frame_image()
+        if img is None:
+            return
+        pos = int(self._player.position())
+        stem = self._entry.name.rsplit(".", 1)[0]
+        name = f"{stem}_frame_{_fmt_ms(pos).replace(':', 'm')}s.jpg"
+        self._vault.import_bytes(
+            name, self._qimage_jpeg(img), "image",
+            self._qimage_jpeg(img, max_side=512, quality=85),
+            folder=self._entry.folder)
+        self.content_added = True   # la galería se recarga al cerrar el visor
+        self._osd(f"📸 Guardada como foto cifrada: {name}")
+
+    def _frame_as_thumb(self):
+        if self._entry.mime != "video" or self._read_only_notice():
+            return
+        img = self._current_frame_image()
+        if img is None:
+            return
+        self._vault.set_thumb(self._entry.id,
+                              self._qimage_jpeg(img, max_side=512, quality=85))
+        self.content_added = True
+        self._osd("🖼 Este fotograma es ahora la miniatura del video")
+
+    def _export_clip(self):
+        if self._entry.mime != "video" or len(self._ab) != 2:
+            self._osd("Marca primero un tramo con A–B (tecla B)")
+            return
+        if self._clip_worker is not None:
+            return
+        stem = self._entry.name.rsplit(".", 1)[0]
+        dst, _ = QFileDialog.getSaveFileName(
+            self, "Exportar recorte A–B (quedará DESCIFRADO en disco)",
+            f"{stem}_recorte.mp4", "Video (*.mp4 *.mkv)")
+        if not dst:
+            return
+        a, b = self._ab
+        self._osd("✂ Exportando recorte…")
+        self._clip_worker = w = _ClipWorker(self._vault, self._entry.id, a, b,
+                                            dst, self)
+
+        def done(res):
+            self._clip_worker = None
+            if isinstance(res, str):
+                QMessageBox.information(
+                    self, "Recorte A–B",
+                    f"Recorte exportado (descifrado) en:\n{res}\n\n"
+                    "Nota honesta: el corte se alinea al keyframe anterior a "
+                    "Ⓐ (sin recodificar no se puede cortar más fino), así que "
+                    "puede empezar hasta unos segundos antes.")
+            else:
+                QMessageBox.warning(self, "Recorte A–B",
+                                    f"No se pudo exportar:\n{res}")
+
+        w.done.connect(done)
+        w.start()
+
+    def _push_jump(self):
+        pos = int(self._player.position())
+        if not self._jump_stack or abs(self._jump_stack[-1] - pos) > 1000:
+            self._jump_stack.append(pos)
+            del self._jump_stack[:-50]
+
+    def _on_slider_jump(self, val: int):
+        # Un salto grande por la barra deja miga de pan para ⌫.
+        if abs(val - self._player.position()) > 5000:
+            self._push_jump()
+        self._player.setPosition(val)
+
+    def _jump_back(self):
+        if not self._jump_stack:
+            self._osd("No hay salto que deshacer")
+            return
+        pos = self._jump_stack.pop()
+        self._player.setPosition(pos)
+        self._osd(f"↩ De vuelta en {_fmt_ms(pos)}")
+
+    def _toggle_info(self):
+        if self._info_lbl.isVisible():
+            self._info_lbl.hide()
+            return
+        e = self._entry
+        img = self._canvas._src
+        res = (f"{img.width()}×{img.height()}"
+               if img is not None and not img.isNull() else "—")
+        lines = [f"<b>{e.name}</b>",
+                 f"Resolución: {res}",
+                 f"Tamaño: {e.size / (1024 * 1024):.1f} MB",
+                 f"Fecha original: "
+                 f"{datetime.fromtimestamp(e.mtime).strftime('%d/%m/%Y %H:%M')}"]
+        if e.mime == "video":
+            lines.insert(2, f"Duración: {_fmt_ms(self._player.duration())}")
+            if e.marks:
+                lines.append(f"Marcadores: {len(e.marks)}")
+        if e.folder:
+            lines.append(f"Carpeta: {e.folder}")
+        self._info_lbl.setText("<br/>".join(lines))
+        self._info_lbl.adjustSize()
+        self._info_lbl.move(16, 16)
+        self._info_lbl.show()
+        self._info_lbl.raise_()
 
     def _toggle_favorite(self):
         if self._read_only_notice():
@@ -640,6 +909,7 @@ class ViewerWindow(QDialog):
     def _goto_mark(self, t: int, rot: int | None):
         # Solo salta: la rotación la resuelve el sistema de segmentos en
         # cuanto llega el primer positionChanged.
+        self._push_jump()   # ⌫ vuelve a donde estabas antes del salto
         self._player.setPosition(t)
 
     def _segment_rotation(self, p: int) -> int | None:
@@ -709,7 +979,7 @@ class ViewerWindow(QDialog):
             row.rot_btn = btn_rot
             self._marks_lay.insertWidget(self._marks_lay.count() - 1, row)
         self._marks_row.setVisible(bool(marks) and visible_now)
-        self._pos.set_marks([(m[0], m[2] is not None) for m in marks])
+        self._pos.set_marks([(m[0], m[2] is not None, m[1]) for m in marks])
 
     def _cycle_mark_rotation(self, t: int, rot: int | None):
         """Icono ↻ del chip: cicla la rotación del segmento en pasos de 90°
@@ -796,22 +1066,54 @@ class ViewerWindow(QDialog):
     # ------------------------------------------------------------------
 
     def _toggle_slideshow(self):
-        self._slideshow = not self._slideshow
+        # P cicla: apagada -> normal -> aleatoria -> apagada.
+        order = [False, "normal", "random"]
+        self._slideshow = order[(order.index(self._slideshow) + 1) % 3]
         if self._slideshow:
-            self._osd("▶ Presentación — P para detener")
+            modo = "aleatoria " if self._slideshow == "random" else ""
+            self._osd(f"▶ Presentación {modo}— P cambia el modo o la detiene")
             if not self.isFullScreen():
                 self._enter_fullscreen()
             if self._entry.mime == "image":
-                self._slide_timer.start(SLIDESHOW_MS)
+                self._start_slide_timers()
             elif self._player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
                 self._toggle()
         else:
             self._slide_timer.stop()
+            self._kb_timer.stop()
+            self._canvas.set_kenburns(1.0)
             self._osd("⏹ Presentación detenida")
+
+    def _start_slide_timers(self):
+        self._slide_timer.start(SLIDESHOW_MS)
+        self._slide_t0 = time.time()
+        self._kb_timer.start()   # Ken Burns: zoom lento durante la foto
+
+    def _kb_tick(self):
+        if self._slideshow and self._entry.mime == "image":
+            prog = (time.time() - self._slide_t0) / (SLIDESHOW_MS / 1000)
+            self._canvas.set_kenburns(1.0 + 0.06 * min(1.0, prog))
+        else:
+            self._kb_timer.stop()
+            self._canvas.set_kenburns(1.0)
+
+    def _advance_slideshow(self):
+        """Avance automático de la presentación (con fundido; en modo
+        aleatorio salta a cualquier otro elemento)."""
+        self._advance_fade = True
+        n = len(self._playlist)
+        if self._slideshow == "random" and n > 1:
+            j = self._idx
+            while j == self._idx:
+                j = random.randrange(n)
+            self._idx = j
+            self._load_current()
+        else:
+            self._go(+1)
 
     def _slideshow_tick(self):
         if self._slideshow and self._entry.mime == "image":
-            self._go(+1)
+            self._advance_slideshow()
 
     def _cycle_repeat(self):
         if self._entry.mime != "video":
@@ -878,7 +1180,7 @@ class ViewerWindow(QDialog):
                 self._idx = nxt
                 self._load_current()          # encadena el siguiente video
         elif self._slideshow:
-            self._go(+1)
+            self._advance_slideshow()
         else:
             self._btn_play.setText("▶")
 
@@ -1032,7 +1334,8 @@ class ViewerWindow(QDialog):
 
     def _on_duration(self, d: int):
         self._pos.setRange(0, d)
-        self._pos.set_marks([(m[0], m[2] is not None) for m in self._entry.marks])
+        self._pos.set_marks(
+            [(m[0], m[2] is not None, m[1]) for m in self._entry.marks])
         if self._pending_resume and 0 < self._pending_resume < d - 2000:
             self._player.setPosition(self._pending_resume)
             self._osd(f"⏵ Continuando en {_fmt_ms(self._pending_resume)}")
@@ -1055,6 +1358,19 @@ class ViewerWindow(QDialog):
             self._toggle_favorite()
         elif k == Qt.Key.Key_P:
             self._toggle_slideshow()
+        elif k == Qt.Key.Key_I:
+            self._toggle_info()
+        elif k == Qt.Key.Key_C:
+            self._canvas.toggle_actual_size()
+        elif k == Qt.Key.Key_U:
+            follow = not self._canvas._loupe_follow
+            self._canvas.set_loupe_follow(follow)
+            self._osd("🔍 Lupa: mueve el ratón (U para quitarla)"
+                      if follow else "Lupa desactivada")
+        elif k == Qt.Key.Key_O and not ev.isAutoRepeat():
+            self._canvas.set_show_original(True)   # mantener pulsada = original
+        elif video and k == Qt.Key.Key_Backspace:
+            self._jump_back()
         elif k == Qt.Key.Key_PageDown:
             self._go(+1)
         elif k == Qt.Key.Key_PageUp:
@@ -1088,6 +1404,13 @@ class ViewerWindow(QDialog):
             return
         ev.accept()
 
+    def keyReleaseEvent(self, ev):
+        if ev.key() == Qt.Key.Key_O and not ev.isAutoRepeat():
+            self._canvas.set_show_original(False)
+            ev.accept()
+            return
+        super().keyReleaseEvent(ev)
+
     # ------------------------------------------------------------------
 
     def _teardown_source(self):
@@ -1103,8 +1426,12 @@ class ViewerWindow(QDialog):
 
     def closeEvent(self, ev):
         self._slide_timer.stop()
+        self._kb_timer.stop()
         self._save_resume()
+        self._save_adjust()
         self._stop_preview()
+        if self._clip_worker is not None:
+            self._clip_worker.wait(30000)   # dejar terminar el recorte
         self._teardown_movie()
         self._teardown_source()
         super().closeEvent(ev)

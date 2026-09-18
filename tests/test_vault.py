@@ -362,6 +362,59 @@ def test_remote_readonly_streaming_and_guards(tmp_path, vault):
     assert rv.get(ev.id).resume_ms == 0
 
 
+def test_import_bytes_and_set_thumb(tmp_path, vault):
+    # importar desde RAM (captura de fotograma): roundtrip bit a bit
+    data = os.urandom(200_000)
+    thumb1 = b"\xff\xd8" + b"t1" * 100
+    e = vault.import_bytes("captura.jpg", data, "image", thumb1)
+    assert e.name == "captura.jpg" and e.size == len(data)
+    r = vault.open_reader(e.id)
+    assert r.read(-1) == data
+    assert vault.read_thumb(e.id) == thumb1
+
+    # reemplazar la miniatura: blob nuevo, el antiguo desaparece del disco
+    old_blob = vault.get(e.id).thumb
+    thumb2 = b"\xff\xd8" + b"t2" * 120
+    vault.set_thumb(e.id, thumb2)
+    assert vault.read_thumb(e.id) == thumb2
+    assert vault.get(e.id).thumb != old_blob
+    assert not vault.store.path_for(old_blob).exists()
+
+    # persiste tras reabrir
+    vault.lock()
+    v2 = Vault.open(tmp_path / "v.vault", PW)
+    assert v2.read_thumb(e.id) == thumb2
+    assert v2.open_reader(e.id).read(-1) == data
+
+
+def test_adjust_and_flip_persist(tmp_path, vault):
+    e = _import(vault, make_photo(tmp_path))
+    assert vault.get(e.id).adjust == {} and not vault.get(e.id).flip_h
+    vault.set_adjust(e.id, {"brightness": 30, "gamma": -20, "smooth": True})
+    vault.set_flip(e.id, True, False)
+    vault.lock()
+    v2 = Vault.open(tmp_path / "v.vault", PW)
+    assert v2.get(e.id).adjust == {"brightness": 30, "gamma": -20, "smooth": True}
+    assert v2.get(e.id).flip_h is True and v2.get(e.id).flip_v is False
+    # remota: no-op silencioso
+    rv = Vault.open_remote(_FakeRemoteStore(tmp_path / "v.vault"), PW)
+    rv.set_adjust(e.id, {})
+    rv.set_flip(e.id, False, True)
+    assert rv.get(e.id).adjust == {"brightness": 30, "gamma": -20, "smooth": True}
+    assert rv.get(e.id).flip_h is True
+
+
+def test_filter_params_roundtrip():
+    from vaultjam.ui.filters import FilterParams
+    p = FilterParams(brightness=10, gamma=-5, smooth=True)
+    d = p.to_dict()
+    assert d == {"brightness": 10, "gamma": -5, "smooth": True}
+    q = FilterParams.from_dict(d)
+    assert (q.brightness, q.gamma, q.smooth, q.contrast) == (10, -5, True, 0)
+    assert FilterParams().to_dict() == {}
+    assert FilterParams.from_dict(None).neutral()
+
+
 def test_pin_curtain(tmp_path, vault):
     assert not vault.has_pin
     with pytest.raises(VaultError):

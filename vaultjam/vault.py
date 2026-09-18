@@ -16,11 +16,13 @@ La capa de UI solo habla con la clase Vault; nunca toca claves ni AEADs.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
 import os
 import struct
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,6 +64,9 @@ class FileEntry:
     favorite: bool = False                            # ⭐ favorito
     thumb_rotation: int = 0                           # rotación SOLO de la miniatura
     thumb_scale: float = 1.0                          # tamaño individual en la galería
+    adjust: dict = field(default_factory=dict)        # ajustes de imagen persistidos
+    flip_h: bool = False                              # espejo horizontal persistido
+    flip_v: bool = False                              # espejo vertical persistido
 
     @property
     def file_id(self) -> bytes:
@@ -438,48 +443,63 @@ class Vault:
         """Cifra e ingiere un archivo. El original NO se toca ni se borra:
         eliminarlo es decisión explícita del usuario (y ver SEGURIDAD.md
         sobre los límites del borrado en SSD)."""
+        src = Path(src)
+        st = src.stat()
+        with open(src, "rb") as f:
+            return self._import_stream(f, st.st_size, src.name, st.st_mtime,
+                                       mime, thumb_jpeg, folder)
+
+    def import_bytes(self, name: str, data: bytes, mime: str,
+                     thumb_jpeg: bytes | None, folder: str = "") -> FileEntry:
+        """Importa contenido que SOLO existe en RAM (p.ej. un fotograma
+        capturado en el visor): jamás pasa por el disco en claro."""
+        return self._import_stream(io.BytesIO(data), len(data), name,
+                                   time.time(), mime, thumb_jpeg, folder)
+
+    def _write_thumb_blob(self, keys: cc.SubKeys, file_id: bytes,
+                          thumb_jpeg: bytes) -> str:
+        """Sella una miniatura con el padding estándar (blob uniforme)."""
+        if len(thumb_jpeg) > cc.CHUNK_SIZE - 4:
+            raise VaultError("Miniatura inesperadamente grande.")
+        padded = struct.pack(">I", len(thumb_jpeg)) + thumb_jpeg
+        padded += b"\x00" * (cc.CHUNK_SIZE - len(padded))
+        return self.store.write(cc.seal(keys.thumbs, padded, cc.thumb_aad(file_id)))
+
+    def _import_stream(self, f, size: int, name: str, mtime: float, mime: str,
+                       thumb_jpeg: bytes | None, folder: str) -> FileEntry:
         self._require_writable()
         keys = self._require_keys()
-        src = Path(src)
-        size = src.stat().st_size
-        st_mtime = src.stat().st_mtime
         file_id = cc.random_bytes(16)
         total = max(1, math.ceil(size / cc.CHUNK_SIZE))
 
         chunk_ids: list[str] = []
         with self._lock:
             try:
-                with open(src, "rb") as f:
-                    for idx in range(total):
-                        chunk = f.read(cc.CHUNK_SIZE)
-                        if len(chunk) < cc.CHUNK_SIZE:
-                            # Relleno con ceros hasta el tamaño fijo. La
-                            # longitud real vive solo en el índice cifrado:
-                            # en disco todos los blobs son idénticos.
-                            chunk = chunk + b"\x00" * (cc.CHUNK_SIZE - len(chunk))
-                        sealed = cc.seal(
-                            keys.content, chunk, cc.chunk_aad(file_id, idx, total)
-                        )
-                        chunk_ids.append(self.store.write(sealed))
+                for idx in range(total):
+                    chunk = f.read(cc.CHUNK_SIZE)
+                    if len(chunk) < cc.CHUNK_SIZE:
+                        # Relleno con ceros hasta el tamaño fijo. La
+                        # longitud real vive solo en el índice cifrado:
+                        # en disco todos los blobs son idénticos.
+                        chunk = chunk + b"\x00" * (cc.CHUNK_SIZE - len(chunk))
+                    sealed = cc.seal(
+                        keys.content, chunk, cc.chunk_aad(file_id, idx, total)
+                    )
+                    chunk_ids.append(self.store.write(sealed))
 
                 thumb_id = None
                 if thumb_jpeg is not None:
                     # La miniatura también se rellena al tamaño de chunk:
                     # si fuera más pequeña, contar "blobs chicos" revelaría
                     # cuántos archivos hay en la bóveda.
-                    if len(thumb_jpeg) > cc.CHUNK_SIZE - 4:
-                        raise VaultError("Miniatura inesperadamente grande.")
-                    padded = struct.pack(">I", len(thumb_jpeg)) + thumb_jpeg
-                    padded += b"\x00" * (cc.CHUNK_SIZE - len(padded))
-                    sealed = cc.seal(keys.thumbs, padded, cc.thumb_aad(file_id))
-                    thumb_id = self.store.write(sealed)
+                    thumb_id = self._write_thumb_blob(keys, file_id, thumb_jpeg)
 
                 entry = FileEntry(
                     id=file_id.hex(),
-                    name=src.name,
+                    name=name,
                     folder=folder,
                     size=size,
-                    mtime=st_mtime,
+                    mtime=mtime,
                     mime=mime,
                     chunks=chunk_ids,
                     thumb=thumb_id,
@@ -492,6 +512,39 @@ class Vault:
                 for cid in chunk_ids:
                     self.store.delete(cid)
                 raise
+
+    def set_thumb(self, entry_id: str, thumb_jpeg: bytes) -> None:
+        """Reemplaza la miniatura (p.ej. «usar este fotograma»): sella el
+        blob nuevo, actualiza el índice y borra el antiguo."""
+        self._require_writable()
+        keys = self._require_keys()
+        e = self._entries[entry_id]
+        new_id = self._write_thumb_blob(keys, e.file_id, thumb_jpeg)
+        with self._lock:
+            old = e.thumb
+            e.thumb = new_id
+            self._save_index()
+        if old:
+            self.store.delete(old)
+
+    def set_adjust(self, entry_id: str, adjust: dict) -> None:
+        """Ajustes de imagen persistidos por elemento (brillo, gamma…).
+        Un dict vacío = sin ajustes. En remotas: solo sesión."""
+        if self.read_only:
+            return
+        with self._lock:
+            self._entries[entry_id].adjust = dict(adjust)
+            self._save_index()
+
+    def set_flip(self, entry_id: str, flip_h: bool, flip_v: bool) -> None:
+        """Espejo horizontal/vertical persistido (como la rotación)."""
+        if self.read_only:
+            return
+        with self._lock:
+            e = self._entries[entry_id]
+            e.flip_h = bool(flip_h)
+            e.flip_v = bool(flip_v)
+            self._save_index()
 
     def read_thumb(self, entry_id: str) -> bytes | None:
         keys = self._require_keys()

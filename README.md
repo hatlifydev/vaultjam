@@ -44,6 +44,18 @@ viven dentro de un índice cifrado; en disco solo se ven blobs idénticos de
   las fotos / apagada), repetición A–B con `B`, y vista previa de
   fotogramas al pasar el ratón por la barra de avance (decodificada en un
   hilo desde el propio lector cifrado).
+- Herramientas del visor: 📸 guarda el fotograma actual como FOTO CIFRADA
+  dentro de la bóveda, 🖼 lo convierte en la miniatura del video, y ✂
+  exporta el tramo A–B como video sin recodificar (corte alineado a
+  keyframes). `⌫` deshace el último salto (barra o marcador); las muescas
+  de la barra muestran el nombre del marcador al pasar el ratón.
+- Inspección: lupa 3× (`U` o botón central del ratón), «antes/después»
+  manteniendo `O`, alternar ajustar↔100 % con `C`, mini-mapa de posición al
+  hacer zoom, e información del elemento con `I`. Espejo ⇋/⇵ y TODOS los
+  ajustes de imagen se recuerdan por elemento (índice cifrado; el original
+  no se toca).
+- Presentación de cine: `P` cicla normal → aleatoria → parar, con fundido
+  entre fotos y zoom lento (Ken Burns).
 - La rotación de cada foto/video se recuerda (visor). Las miniaturas tienen
   su PROPIA rotación, independiente (clic derecho → «↻ Girar miniatura
   90°»: girar la miniatura no gira el contenido, ni al revés) y su propio
