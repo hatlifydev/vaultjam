@@ -1275,14 +1275,10 @@ class ViewerWindow(QDialog):
         r = self._stream_reader
         if r is None or self._entry.mime != "video":
             return
-        # Ancla = posición REAL de reproducción (el demuxer lee el final
-        # del MP4 al abrir y su posición de lectura no sirve de ancla).
-        anchor = None
-        dur = self._player.duration()
-        if dur > 0:
-            frac = min(1.0, max(0.0, self._player.position() / dur))
-            anchor = int(frac * max(0, self._entry.total_chunks - 1))
-        r.prefetch_ahead(8, start_idx=anchor)  # sigue cargando, incluso en pausa
+        # Sin start_idx: el lector ancla en su frontera de lectura real (la
+        # posición de bytes que el reproductor consume), no en una
+        # estimación tiempo→byte. Así la pre-carga es contiguable de verdad.
+        r.prefetch_ahead(8)                    # sigue cargando, incluso en pausa
         self._pos.set_buffered(r.buffered_ranges())
 
     def _fallback_buffer(self):

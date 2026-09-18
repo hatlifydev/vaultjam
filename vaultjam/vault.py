@@ -777,12 +777,14 @@ class ChunkReader:
 
     def prefetch_ahead(self, n: int = 8, start_idx: int | None = None,
                        horizon: int = 64) -> None:
-        """Relleno PROGRESIVO del buffer: cada llamada pide el siguiente
-        lote (n) de chunks AÚN NO descargados dentro del horizonte, desde
-        `start_idx` (la posición de reproducción que pasa el visor — no la
-        del demuxer, que sondea el final del MP4 y engañaría al ancla).
-        Invocado cada tick, el buffer sigue creciendo con el video EN
-        PAUSA hasta llenar el horizonte, que avanza al reproducir."""
+        """Relleno PROGRESIVO del buffer desde la FRONTERA DE LECTURA REAL
+        del reproductor (`self._pos`, que el demuxer avanza a través del
+        DecryptingIODevice), no desde una estimación tiempo→byte, que en
+        video de bitrate variable apunta a chunks equivocados. Anclando en
+        la lectura real, la pre-carga siempre va justo por delante de donde
+        el reproductor consume: contiguo al reproducir y correcto en pausa
+        (los próximos bytes que pedirá al reanudar). Cada tick pide el
+        siguiente lote (n) aún no descargado dentro del horizonte."""
         pf = getattr(self._store, "prefetch", None)
         if pf is None or not self._entry.chunks:
             return
