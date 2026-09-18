@@ -63,7 +63,18 @@ def get_service(client_secret_path: str, readonly: bool = True):
         flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, scopes)
         # Abre el navegador del usuario; el "servidor" es un puerto efímero
         # en localhost solo para recibir el código OAuth.
-        creds = flow.run_local_server(port=0)
+        #  - prompt="select_account": SIEMPRE muestra el selector de cuentas
+        #    (sin esto, Google reutiliza la sesión activa del navegador y
+        #    puede autorizar con la cuenta equivocada).
+        #  - timeout_seconds: si el usuario cancela o cierra la pestaña,
+        #    Google nunca redirige al puerto local; sin timeout el flujo se
+        #    quedaría colgado para siempre y no se podría reintentar.
+        creds = flow.run_local_server(port=0, prompt="select_account",
+                                      timeout_seconds=180)
+        if creds is None:
+            raise RuntimeError(
+                "La autorización no se completó (cancelada o caducada). "
+                "Vuelve a intentarlo y elige la cuenta correcta.")
         APPDIR.mkdir(parents=True, exist_ok=True)
         token_path.write_text(creds.to_json(), encoding="utf-8")
     return build("drive", "v3", credentials=creds, cache_discovery=False)
