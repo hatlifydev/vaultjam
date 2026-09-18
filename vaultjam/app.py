@@ -23,6 +23,8 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("VaultJam")
     app.setOrganizationName("VaultJam")
+    from .ui.theme import apply_theme
+    apply_theme(app)
 
     while True:
         dlg = UnlockDialog()

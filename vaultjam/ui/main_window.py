@@ -8,14 +8,16 @@ El bloqueo (manual o por inactividad) sigue un orden estricto:
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QFrame, QInputDialog, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
-    QProgressBar, QProgressDialog, QPushButton, QSlider, QSplitter,
-    QToolBar, QVBoxLayout, QWidget,
+    QFileDialog, QFrame, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressBar,
+    QProgressDialog, QPushButton, QSizePolicy, QSlider, QSplitter, QToolBar,
+    QToolButton, QVBoxLayout, QWidget,
 )
 
 from ..thumbs import PHOTO_EXTS, VIDEO_EXTS, classify, make_thumbnail
@@ -73,7 +75,9 @@ class _SyncWorker(QThread):
 
     progress = Signal(int, int)
     status = Signal(str)
-    finished_ok = Signal(object)   # dict resumen | Exception
+    inventoryReady = Signal(object)   # set de blobs ya completos en Drive
+    blobDone = Signal(str)            # cada blob recién subido (marcos en vivo)
+    finished_ok = Signal(object)      # dict resumen | Exception
 
     def __init__(self, secret: str, root, blob_ids: list[str],
                  folder_name: str, folder_hint: str | None, parent=None):
@@ -106,7 +110,9 @@ class _SyncWorker(QThread):
             self.finished_ok.emit(syncer.sync(
                 progress=lambda d, t: self.progress.emit(d, t),
                 status=lambda m: self.status.emit(m),
-                cancelled=lambda: self._cancel))
+                cancelled=lambda: self._cancel,
+                on_inventory=lambda ok: self.inventoryReady.emit(ok),
+                blob_done=lambda b: self.blobDone.emit(b)))
         except Exception as e:  # noqa: BLE001
             self.finished_ok.emit(e)
 
@@ -215,10 +221,12 @@ class MainWindow(QMainWindow):
         self._sync_label.setWordWrap(True)
         self._sync_bar = QProgressBar()
         self._sync_bar.setRange(0, 0)
+        self._sync_eta = QLabel("")          # tiempo estimado restante
+        self._sync_eta.setWordWrap(True)
         self._sync_cancel_btn = QPushButton("Cancelar subida")
         self._sync_cancel_btn.clicked.connect(self._cancel_sync)
         for wdg in (sync_title, self._sync_label, self._sync_bar,
-                    self._sync_cancel_btn):
+                    self._sync_eta, self._sync_cancel_btn):
             sp.addWidget(wdg)
         self._sync_panel.hide()
 
@@ -236,61 +244,104 @@ class MainWindow(QMainWindow):
         split.setSizes([190, 900])
         self.setCentralWidget(split)
 
+        # ------------------------------------------------------------------
+        # Barra principal COMPACTA: solo lo primario a la vista. Todo lo
+        # secundario vive en el menú ☰; el zoom, en la barra de estado.
+        # ------------------------------------------------------------------
         tb = QToolBar("Principal")
         tb.setMovable(False)
         self.addToolBar(tb)
+
         self._act_import = tb.addAction("📥 Importar", self._import)
-        self._act_export = tb.addAction("📤 Exportar", self._export)
-        self._act_delete = tb.addAction("🗑 Eliminar", self._delete)
+
+        # Filtro por tipo: Todo / Fotos / Videos (exclusivo).
         tb.addSeparator()
-        self._act_newfolder = tb.addAction("📁 Nueva carpeta", self._new_folder)
-        self._act_move = tb.addAction("📂 Mover a…", self._move_selected)
+        self._type_group = QActionGroup(self)
+        self._type_group.setExclusive(True)
+        for label, mime in (("Todo", None), ("📷 Fotos", "image"),
+                            ("🎬 Videos", "video")):
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setChecked(mime is None)
+            act.setData(mime)
+            act.triggered.connect(
+                lambda _=False, m=mime: self._set_type_filter(m))
+            self._type_group.addAction(act)
+            tb.addAction(act)
         tb.addSeparator()
 
-        tb.addWidget(QLabel(" Zoom: "))
-        self._zoom = QSlider(Qt.Orientation.Horizontal)
-        self._zoom.setRange(64, 512)
-        self._zoom.setValue(160)
-        self._zoom.setFixedWidth(160)
-        self._zoom.valueChanged.connect(self._gallery.set_zoom)
-        tb.addWidget(self._zoom)
-        tb.addSeparator()
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding,
+                             QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
 
-        tb.addWidget(QLabel(" Auto-bloqueo: "))
-        self._autolock_combo = QComboBox()
-        for label, _secs in AUTOLOCK_CHOICES:
-            self._autolock_combo.addItem(label)
-        self._autolock_combo.setCurrentIndex(1)  # 5 min por defecto
-        self._autolock_combo.currentIndexChanged.connect(self._reset_autolock)
-        tb.addWidget(self._autolock_combo)
-        tb.addSeparator()
-
-        # Anti-captura (SetWindowDisplayAffinity): la galería y los visores
-        # aparecen en negro en capturas, grabaciones, pantalla compartida y
-        # Windows Recall. Activado por defecto; interruptor visible por si
-        # necesitas compartir pantalla a propósito. No se persiste en disco
-        # (la app no escribe preferencias fuera de la bóveda).
-        self._act_protect = tb.addAction("🕶 Anti-captura")
+        # Acciones que van al menú ☰ (creadas como QAction sueltas).
+        self._act_export = QAction("📤 Exportar…", self)
+        self._act_export.triggered.connect(self._export)
+        self._act_delete = QAction("🗑 Eliminar", self)
+        self._act_delete.triggered.connect(self._delete)
+        self._act_newfolder = QAction("📁 Nueva carpeta…", self)
+        self._act_newfolder.triggered.connect(self._new_folder)
+        self._act_move = QAction("📂 Mover a carpeta…", self)
+        self._act_move.triggered.connect(self._move_selected)
+        self._act_pin = QAction("🔢 PIN de la cortina…", self)
+        self._act_pin.setToolTip("Crear, cambiar, quitar o restablecer el PIN")
+        self._act_pin.triggered.connect(self._change_pin)
+        # Anti-captura (SetWindowDisplayAffinity): ventanas en negro para
+        # capturas/grabación/Recall. Activado por defecto; no se persiste.
+        self._act_protect = QAction("🕶 Anti-captura", self)
         self._act_protect.setCheckable(True)
         self._act_protect.setChecked(True)
-        self._act_protect.setToolTip(
-            "Excluir la galería y los visores de capturas de pantalla, "
-            "grabación y Recall (Windows 10 2004+)."
-        )
         self._act_protect.toggled.connect(self._apply_capture_protection)
-        # Cortina 🙈 con PIN: oculta miniaturas y nombres e impide abrir,
-        # sin bloquear la bóveda (una sincronización sigue corriendo).
+
+        self._more_menu = QMenu(self)
+        self._more_menu.addAction(self._act_export)
+        self._more_menu.addAction(self._act_delete)
+        self._more_menu.addSeparator()
+        self._more_menu.addAction(self._act_newfolder)
+        self._more_menu.addAction(self._act_move)
+        self._more_menu.addSeparator()
+        self._more_menu.addAction(self._act_pin)
+        self._more_menu.addAction(self._act_protect)
+        lock_menu = self._more_menu.addMenu("⏱ Auto-bloqueo")
+        self._autolock_secs = 300
+        lock_group = QActionGroup(self)
+        lock_group.setExclusive(True)
+        for label, secs in AUTOLOCK_CHOICES:
+            a = QAction(label, self)
+            a.setCheckable(True)
+            a.setChecked(secs == self._autolock_secs)
+            a.triggered.connect(
+                lambda _=False, s=secs: self._set_autolock_secs(s))
+            lock_group.addAction(a)
+            lock_menu.addAction(a)
+
+        # Cortina 🙈 con PIN: oculta sin bloquear (el sync sigue corriendo).
         self._privacy = False
         self._act_privacy = tb.addAction("🙈 Ocultar", self._toggle_privacy)
         self._act_privacy.setToolTip(
-            "Ocultar el contenido en pantalla (miniaturas, nombres y visor) "
-            "sin bloquear la bóveda. Para mostrar de nuevo pide el PIN.")
-        self._act_pin = tb.addAction("PIN…", self._change_pin)
-        self._act_pin.setToolTip("Crear o cambiar el PIN de la cortina "
-                                 "(cambiarlo pide el PIN actual)")
-        tb.addSeparator()
-        tb.addAction("🔒 Bloquear ahora", self.lock_now)
+            "Ocultar miniaturas, nombres y visor sin bloquear la bóveda. "
+            "«Mostrar» pide el PIN.")
+
+        more_btn = QToolButton()
+        more_btn.setText("☰")
+        more_btn.setToolTip("Más acciones")
+        more_btn.setMenu(self._more_menu)
+        more_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        tb.addWidget(more_btn)
+
+        tb.addAction("🔒", self.lock_now).setToolTip("Bloquear ahora")
         set_capture_protection(self, True)
+
+        # Zoom de la galería: discreto, en la barra de estado.
+        self._zoom = QSlider(Qt.Orientation.Horizontal)
+        self._zoom.setRange(64, 512)
+        self._zoom.setValue(160)
+        self._zoom.setFixedWidth(140)
+        self._zoom.setToolTip("Tamaño de las miniaturas")
+        self._zoom.valueChanged.connect(self._gallery.set_zoom)
+        self.statusBar().addPermanentWidget(QLabel("🔍"))
+        self.statusBar().addPermanentWidget(self._zoom)
 
         # Temporizador de inactividad sobre TODA la aplicación.
         self._autolock = QTimer(self)
@@ -321,14 +372,24 @@ class MainWindow(QMainWindow):
                 "Sube a tu Google Drive los blobs cifrados que falten y "
                 "actualiza el índice (espejo de respaldo/visualización). "
                 "Reanudable y verificado; requiere autorizar escritura.")
-            self._act_mirror = tb.addAction("🔄 Verificar espejo",
-                                            self._check_mirror)
+            self._act_mirror = QAction("🔄 Verificar espejo de Drive", self)
             self._act_mirror.setToolTip(
                 "Comprobar qué elementos están ya completos en el espejo de "
                 "Drive: marco verde = subido entero, rojo = aún incompleto. "
                 "Solo lee listados; no sube nada.")
+            self._act_mirror.triggered.connect(self._check_mirror)
+            self._more_menu.insertAction(self._act_pin, self._act_mirror)
+            self._more_menu.insertSeparator(self._act_pin)
         self._sync_worker: _SyncWorker | None = None
         self._mirror_worker: _MirrorCheckWorker | None = None
+        # Marcos del espejo al abrir la bóveda local, sin que tengas que
+        # pedirlo: si hay credencial y ya se sincronizó alguna vez, se
+        # comprueba solo (silencioso si falla).
+        if not vault.read_only:
+            settings0 = QSettings("VaultJam", "VaultJam")
+            if (str(settings0.value("gdrive_secret", ""))
+                    and str(settings0.value(f"syncfolder/{vault.root}", ""))):
+                QTimer.singleShot(800, self._check_mirror)
 
         self._update_action_states()
         self._reload_sidebar(select=None)
@@ -357,6 +418,41 @@ class MainWindow(QMainWindow):
             self._sync_worker.cancel()
             self._sync_cancel_btn.setEnabled(False)
             self._sync_label.setText("Cancelando… (termina el blob en curso)")
+
+    @staticmethod
+    def _fmt_eta(seconds: float) -> str:
+        s = int(seconds)
+        if s >= 3600:
+            return f"{s // 3600} h {(s % 3600) // 60} min"
+        if s >= 60:
+            return f"{s // 60} min"
+        return f"{s} s"
+
+    def _on_sync_inventory(self, ok_set):
+        """Al arrancar el sync: pintar el estado real del espejo de golpe."""
+        if self._vault.is_locked:
+            return
+        status = {}
+        self._live_remaining = {}
+        for e in self._vault.entries():
+            missing = {c for c in e.chunks if c not in ok_set}
+            status[e.id] = not missing
+            if missing:
+                self._live_remaining[e.id] = missing
+        self._gallery.set_availability(status)
+
+    def _on_sync_blob(self, blob_id: str):
+        """Cada blob subido acerca a su elemento al verde; al completarse,
+        su marco cambia en vivo, sin esperar al final."""
+        eid = self._blob2entry.get(blob_id)
+        rem = self._live_remaining.get(eid) if eid else None
+        if rem is None:
+            return
+        rem.discard(blob_id)
+        if not rem:
+            del self._live_remaining[eid]
+            if not self._vault.is_locked:
+                self._gallery.set_one_availability(eid, True)
 
     def _apply_mirror_availability(self, ok_blobs: set):
         """Pinta los marcos verde/rojo de la bóveda LOCAL según qué blobs
@@ -440,13 +536,31 @@ class MainWindow(QMainWindow):
         # Panel lateral en marcha (no modal: la bóveda sigue usable)
         self._sync_bar.setRange(0, 0)
         self._sync_label.setText("Autorizando con Google…")
+        self._sync_eta.setText("")
+        self._sync_t0 = time.monotonic()
         self._sync_cancel_btn.setEnabled(True)
         self._sync_panel.show()
         w.status.connect(self._sync_label.setText)
 
+        # Marcos verde/rojo EN VIVO: mapa blob->elemento para ir pintando
+        # cada elemento en cuanto su último chunk termina de subir.
+        self._blob2entry = {}
+        self._live_remaining: dict[str, set] = {}
+        for e in self._vault.entries():
+            for c in e.chunks:
+                self._blob2entry[c] = e.id
+        w.inventoryReady.connect(self._on_sync_inventory)
+        w.blobDone.connect(self._on_sync_blob)
+
         def on_progress(done: int, total: int):
             self._sync_bar.setRange(0, max(total, 1))
             self._sync_bar.setValue(done)
+            elapsed = time.monotonic() - self._sync_t0
+            if done > 0 and elapsed > 3:
+                rate = done / elapsed
+                left = (total - done) / rate if rate > 0 else 0
+                self._sync_eta.setText(
+                    f"⏳ ~{self._fmt_eta(left)} restantes · {rate:.1f} blobs/s")
 
         w.progress.connect(on_progress)
 
@@ -613,6 +727,16 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
 
+    def _set_autolock_secs(self, secs: int):
+        self._autolock_secs = secs
+        self._reset_autolock()
+
+    def _set_type_filter(self, mime: str | None):
+        """Filtro Todo/Fotos/Videos sobre la vista actual de la galería."""
+        self._gallery.set_type_filter(mime)
+        self._load_gallery_view()
+        self._update_status()
+
     def _reset_autolock(self):
         # Con una sincronización a Drive o una importación en curso, la
         # cuenta atrás de auto-bloqueo se SUSPENDE: bloquear a mitad
@@ -622,8 +746,7 @@ class MainWindow(QMainWindow):
                 or self._import_worker is not None):
             self._autolock.stop()
             return
-        secs = AUTOLOCK_CHOICES[self._autolock_combo.currentIndex()][1]
-        self._autolock.start(secs * 1000)
+        self._autolock.start(self._autolock_secs * 1000)
 
     def _update_status(self):
         suffix = "  ·  remota Google Drive (solo lectura)" if self._vault.read_only else ""

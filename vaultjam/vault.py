@@ -725,6 +725,14 @@ class ChunkReader:
         self._cache[idx] = plain
         if len(self._cache) > self._cache_max:
             self._cache.popitem(last=False)
+        # Lectura adelantada en almacenes remotos: pedir YA los próximos
+        # chunks en segundo plano. Reproducir fluye, y tras un salto la
+        # ventana de pre-carga sigue al nuevo punto automáticamente.
+        pf = getattr(self._store, "prefetch", None)
+        if pf is not None:
+            nxt = e.chunks[idx + 1: idx + 4]
+            if nxt:
+                pf(nxt)
         return plain
 
     # API estilo archivo (usable por PyAV y por el QIODevice del visor)

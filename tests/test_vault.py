@@ -277,17 +277,21 @@ class _FakeRemoteStore:
     writable = False
     name = "prueba-remota"
 
-    def __init__(self, root):
-        self.root = Path(root)
-
     def read_header(self):
         return (self.root / "header.json").read_bytes()
 
     def read_index(self):
         return (self.root / "index.enc").read_bytes()
 
+    def __init__(self, root):
+        self.root = Path(root)
+        self.prefetched: list = []
+
     def read(self, blob_id):
         return (self.root / "blobs" / blob_id[:2] / f"{blob_id}.blob").read_bytes()
+
+    def prefetch(self, blob_ids):
+        self.prefetched.extend(blob_ids)
 
     def available_blobs(self):
         return {p.stem for p in (self.root / "blobs").rglob("*.blob")}
@@ -339,6 +343,9 @@ def test_remote_readonly_streaming_and_guards(tmp_path, vault):
     r = rv.open_reader(ev.id)
     r.seek(cc.CHUNK_SIZE + 7)
     assert r.read(50) == original[cc.CHUNK_SIZE + 7: cc.CHUNK_SIZE + 57]
+    # lectura adelantada: al tocar el chunk 1, se pidieron los siguientes
+    assert store.prefetched, "el lector no pre-cargó chunks"
+    assert set(store.prefetched) <= set(rv.get(ev.id).chunks)
     r.seek(0)
     assert r.read(-1) == original
     assert rv.read_thumb(ep.id)[:2] == b"\xff\xd8"

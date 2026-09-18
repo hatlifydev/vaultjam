@@ -105,17 +105,25 @@ def test_sync_full_mirror_and_second_pass(synced):
     vault, ops, syncer, original = synced
     n = len(vault.all_blob_ids())
 
-    s1 = syncer.sync()
+    inv: list = []
+    done_blobs: list = []
+    s1 = syncer.sync(on_inventory=inv.append, blob_done=done_blobs.append)
     assert not s1["cancelado"]
     assert s1["subidos"] == n and s1["ya_presentes"] == 0
     assert s1["huerfanos"] == 0
     assert s1["ok_blobs"] == set(vault.all_blob_ids())   # para los marcos
+    # callbacks de marcos en vivo: inventario inicial vacío y un aviso
+    # por cada blob subido
+    assert inv == [set()]
+    assert set(done_blobs) == set(vault.all_blob_ids())
 
     # segunda pasada: nada que subir (reanudable e idempotente)
+    inv2: list = []
     s2 = DriveSyncer(ops, vault.root, vault.all_blob_ids(),
-                     folder_name="v.vault").sync()
+                     folder_name="v.vault").sync(on_inventory=inv2.append)
     assert s2["subidos"] == 0 and s2["ya_presentes"] == n
     assert s2["folder_id"] == s1["folder_id"]
+    assert inv2 == [set(vault.all_blob_ids())]   # segunda pasada: todo verde ya
 
     # el espejo es una bóveda remota usable, bit a bit
     rv = Vault.open_remote(MemRemoteStore(ops, s1["folder_id"]), PW)

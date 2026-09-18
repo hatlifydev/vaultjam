@@ -63,6 +63,18 @@ viven dentro de un índice cifrado; en disco solo se ven blobs idénticos de
   puede ser más grande que el resto).
 - El campo de contraseña recibe el foco automáticamente al abrir la app,
   al cambiar de pestaña y tras un error de contraseña: teclea y Enter.
+- Interfaz moderna: tema oscuro (Fusion + QSS con acento índigo), barra
+  principal compacta (Importar, filtro Todo/📷/🎬, Ocultar, ☰, 🔒) con lo
+  secundario en el menú ☰ (exportar, eliminar, carpetas, PIN,
+  anti-captura, auto-bloqueo) y el zoom de la galería en la barra de
+  estado.
+- Marcos de espejo EN VIVO en la bóveda local: al abrir se comprueba solo
+  (si ya sincronizaste alguna vez) y, durante la sincronización, cada
+  elemento se pone verde en cuanto su último chunk termina de subir. El
+  panel muestra tiempo estimado restante y ritmo (blobs/s).
+- Remoto rápido: miniaturas, video y previews descargan EN PARALELO (un
+  cliente HTTP por hilo) y el reproductor pre-carga los próximos chunks
+  (también tras un salto), para un streaming sin tirones.
 - La pantalla de apertura puede recordar las últimas bóvedas (solo las
   RUTAS, en el registro de Windows). Es opcional: la casilla «Recordar las
   últimas bóvedas abiertas» lo activa/desactiva (al desactivar se borra lo

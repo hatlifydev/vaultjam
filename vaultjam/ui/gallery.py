@@ -64,17 +64,34 @@ class _ThumbLoader(QThread):
         self._stop = True
 
     def run(self):
-        for eid in self._ids:
+        # Descifrado de miniaturas EN PARALELO (mismo patrón que la
+        # sincronización): en bóvedas remotas cada hilo descarga con su
+        # propio cliente HTTP, así 6 miniaturas bajan a la vez; en local,
+        # 3 hilos solapan AES + decodificación JPEG.
+        import concurrent.futures as cf
+        workers = getattr(self._vault.store, "parallel_reads", 1)
+        workers = max(1, min(6, workers)) if workers > 1 else 3
+
+        def job(eid):
             if self._stop or self._vault.is_locked:
-                return
+                return None
             try:
                 data = self._vault.read_thumb(eid)
             except Exception:
-                continue  # miniatura corrupta: se queda el placeholder
-            if data:
-                img = QImage.fromData(data)
-                if not img.isNull():
-                    self.thumbReady.emit(eid, img)
+                return None   # miniatura corrupta: se queda el placeholder
+            if not data:
+                return None
+            img = QImage.fromData(data)
+            return None if img.isNull() else (eid, img)
+
+        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(job, eid) for eid in self._ids]
+            for f in cf.as_completed(futs):
+                if self._stop:
+                    continue   # drenar rápido lo pendiente
+                r = f.result()
+                if r is not None:
+                    self.thumbReady.emit(r[0], r[1])
 
 
 class GalleryWidget(QWidget):
@@ -118,6 +135,7 @@ class GalleryWidget(QWidget):
         # incompleto (marco rojo), ausente = sin información (sin marco).
         self._avail: dict[str, bool] = {}
         self._privacy = False    # cortina 🙈: iconos y nombres ocultos
+        self._mime_filter: str | None = None   # None | "image" | "video"
         self.set_zoom(160)
 
     # ------------------------------------------------------------------
@@ -193,6 +211,20 @@ class GalleryWidget(QWidget):
                 item.setToolTip("")
             self._apply_pixmap(item)
 
+    def set_type_filter(self, mime: str | None):
+        """None = todo; "image" / "video" limitan la vista actual."""
+        self._mime_filter = mime
+
+    def set_one_availability(self, entry_id: str, ok: bool):
+        """Actualiza el marco de UN elemento (marcado en vivo durante la
+        sincronización: se pone verde en cuanto termina de subir)."""
+        self._avail[entry_id] = ok
+        for row in range(self._model.rowCount()):
+            item = self._model.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == entry_id:
+                self._apply_pixmap(item)
+                break
+
     def set_availability(self, status: dict[str, bool]):
         """Aplica (y recuerda para futuras recargas) la disponibilidad
         remota de cada elemento, repintando los marcos en sitio."""
@@ -237,6 +269,8 @@ class GalleryWidget(QWidget):
         self._loaded = loaded
         self._vault = vault
         entries = vault.entries(None if favorites else folder, favorites=favorites)
+        if self._mime_filter is not None:
+            entries = [e for e in entries if e.mime == self._mime_filter]
         for e in entries:
             item = QStandardItem()
             # Con la cortina activa, ni siquiera una recarga (cambio de

@@ -122,14 +122,21 @@ class DriveStore:
     writable = False
 
     def __init__(self, service, folder_id: str, name: str = "",
-                 cache_blobs: int = 48):
+                 cache_blobs: int = 48, service_factory=None):
         self._svc = service
+        self._svc_factory = service_factory   # un cliente HTTP por hilo
+        self._tls = threading.local()
         self.folder_id = folder_id
         self.name = name or folder_id
         self._lock = threading.RLock()
         self._children: dict[str, dict[str, str]] = {}   # folderId -> {nombre: id}
         self._cache: OrderedDict[str, bytes] = OrderedDict()
         self._cache_max = cache_blobs
+        self._inflight: set[str] = set()      # pre-cargas en vuelo (dedup)
+        self._prefetch_pool = None
+        # Con fábrica de servicios, las descargas pueden ir EN PARALELO
+        # (miniaturas, video y previews a la vez, sin cola única).
+        self.parallel_reads = 6 if service_factory else 1
 
         root = self._list(folder_id)
         if "header.json" not in root or "blobs" not in root:
@@ -159,15 +166,54 @@ class DriveStore:
             self._children[folder_id] = out
             return out
 
-    def _download(self, file_id: str) -> bytes:
+    @staticmethod
+    def _download_with(svc, file_id: str) -> bytes:
         from googleapiclient.http import MediaIoBaseDownload
-        with self._lock:
-            buf = io.BytesIO()
-            dl = MediaIoBaseDownload(buf, self._svc.files().get_media(fileId=file_id))
-            done = False
-            while not done:
-                _, done = dl.next_chunk()
-            return buf.getvalue()
+        buf = io.BytesIO()
+        dl = MediaIoBaseDownload(buf, svc.files().get_media(fileId=file_id))
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        return buf.getvalue()
+
+    def _download(self, file_id: str) -> bytes:
+        if self._svc_factory is not None:
+            # Cliente propio de este hilo: descargas simultáneas reales
+            # (el cliente de Google no es thread-safe, pero uno por hilo sí).
+            svc = getattr(self._tls, "svc", None)
+            if svc is None:
+                svc = self._svc_factory()
+                self._tls.svc = svc
+            return self._download_with(svc, file_id)
+        with self._lock:   # un solo servicio: serializar como antes
+            return self._download_with(self._svc, file_id)
+
+    def prefetch(self, blob_ids: list[str]) -> None:
+        """Pre-descarga en segundo plano: el lector de video la invoca con
+        los PRÓXIMOS chunks mientras el reproductor consume el actual, y
+        tras un salto, con los que siguen al nuevo punto. Reproducir deja
+        de atascarse esperando cada descarga."""
+        if self._svc_factory is None:
+            return
+        if self._prefetch_pool is None:
+            import concurrent.futures as cf
+            self._prefetch_pool = cf.ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="vj-prefetch")
+        for b in blob_ids:
+            with self._lock:
+                if b in self._cache or b in self._inflight:
+                    continue
+                self._inflight.add(b)
+            self._prefetch_pool.submit(self._prefetch_one, b)
+
+    def _prefetch_one(self, blob_id: str) -> None:
+        try:
+            self.read(blob_id)      # read() cachea el resultado
+        except Exception:
+            pass                    # la lectura real reintentará y avisará
+        finally:
+            with self._lock:
+                self._inflight.discard(blob_id)
 
     def refresh(self) -> None:
         """Descarta los listados cacheados: la próxima consulta verá el

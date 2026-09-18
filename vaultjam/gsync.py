@@ -178,7 +178,9 @@ class DriveSyncer:
 
     def sync(self, progress=lambda done, total: None,
              status=lambda msg: None,
-             cancelled=lambda: False) -> dict:
+             cancelled=lambda: False,
+             on_inventory=lambda ok: None,
+             blob_done=lambda b: None) -> dict:
         status("Localizando la carpeta espejo en Drive…")
         fid = self._resolve_folder()
         root_children = self.ops.list_children(fid)
@@ -197,6 +199,10 @@ class DriveSyncer:
                 plan.append((b, m["id"]))              # tamaño mal: re-subir
         total = len(plan)
         progress(0, total)
+        # Estado inicial del espejo: qué blobs ya estaban completos (la UI
+        # pinta los marcos verde/rojo desde el primer segundo).
+        on_inventory({b for b in self.expected
+                      if remote.get(b, {}).get("size") == EXPECTED_BLOB_SIZE})
 
         # Las subcarpetas que falten se crean ANTES y en secuencia: crearlas
         # desde varios hilos a la vez duplicaría carpetas en Drive.
@@ -205,7 +211,7 @@ class DriveSyncer:
 
         if total and self.workers > 1 and self.ops_factory is not None:
             uploaded, corrected = self._upload_parallel(
-                plan, sub_ids, progress, status, cancelled)
+                plan, sub_ids, progress, status, cancelled, blob_done)
         else:
             uploaded = corrected = 0
             for i, (b, existing) in enumerate(plan):
@@ -218,6 +224,7 @@ class DriveSyncer:
                 if existing:
                     corrected += 1
                 uploaded += 1
+                blob_done(b)
                 progress(uploaded, total)
         if cancelled():
             # Cancelar es seguro: el índice NO se ha tocado; lo subido
@@ -229,7 +236,8 @@ class DriveSyncer:
         return self._commit_and_verify(fid, blobs_id, root_children,
                                        uploaded, corrected, status)
 
-    def _upload_parallel(self, plan, sub_ids, progress, status, cancelled):
+    def _upload_parallel(self, plan, sub_ids, progress, status, cancelled,
+                         blob_done=lambda b: None):
         """Sube el plan con un pool de hilos; DriveOps por hilo vía la
         fábrica. Al cancelar, las tareas no arrancadas se descartan y las
         en vuelo terminan su blob (estado siempre consistente)."""
@@ -250,7 +258,7 @@ class DriveSyncer:
                 sub_ids[b[:2]], f"{b}.blob",
                 self.root / "blobs" / b[:2] / f"{b}.blob",
                 existing_id=existing)
-            return existing is not None
+            return (b, existing is not None)
 
         total = len(plan)
         done = corrected = 0
@@ -267,9 +275,11 @@ class DriveSyncer:
                     continue
                 if r is None:
                     continue            # descartada por cancelación
+                b, was_fix = r
                 done += 1
-                if r:
+                if was_fix:
                     corrected += 1
+                blob_done(b)
                 status(f"Subiendo… {done} de {total} "
                        f"({self.workers} en paralelo)")
                 progress(done, total)

@@ -253,6 +253,7 @@ class UnlockDialog(QDialog):
         form = QFormLayout(w)
 
         self._gd_service = None
+        self._gd_creds = None
         self._gd_secret = QLineEdit(
             str(QSettings("VaultJam", "VaultJam").value("gdrive_secret", "")))
         btn_sec = QPushButton("Examinar…")
@@ -307,6 +308,7 @@ class UnlockDialog(QDialog):
         from ..gdrive import forget_token
         forget_token()
         self._gd_service = None
+        self._gd_creds = None
         self._gd_combo.clear()
         QMessageBox.information(
             self, "Google Drive",
@@ -325,9 +327,10 @@ class UnlockDialog(QDialog):
         self._busy(True, "Conectando con Google (la primera vez se abre el navegador)…")
 
         def job():
-            from ..gdrive import find_vaults, get_service
-            svc = get_service(secret)
-            return (svc, find_vaults(svc))
+            from ..gdrive import build_service, find_vaults, get_credentials
+            creds = get_credentials(secret, readonly=True)
+            svc = build_service(creds)
+            return (creds, svc, find_vaults(svc))
 
         self._worker = _KdfWorker(job)
         self._worker.done.connect(self._on_gd_connected)
@@ -336,7 +339,7 @@ class UnlockDialog(QDialog):
     def _on_gd_connected(self, result):
         self._busy(False)
         if isinstance(result, tuple):
-            self._gd_service, vaults = result
+            self._gd_creds, self._gd_service, vaults = result
             self._gd_combo.clear()
             for name, fid in vaults:
                 self._gd_combo.addItem(name, fid)
@@ -362,12 +365,17 @@ class UnlockDialog(QDialog):
         fid = self._gd_combo.currentData()
         name = self._gd_combo.currentText()
         svc = self._gd_service
+        creds = self._gd_creds
         self._last_tab = "drive"
         self._busy(True, "Leyendo la bóveda remota y derivando clave (Argon2id)…")
 
         def job():
-            from ..gdrive import DriveStore
-            return Vault.open_remote(DriveStore(svc, fid, name), pw)
+            from ..gdrive import DriveStore, build_service
+            # Fábrica de clientes por hilo: miniaturas, video y previews
+            # descargan en paralelo en vez de hacer cola una a una.
+            store = DriveStore(svc, fid, name,
+                               service_factory=lambda: build_service(creds))
+            return Vault.open_remote(store, pw)
 
         self._worker = _KdfWorker(job)
         self._worker.done.connect(self._on_done)
