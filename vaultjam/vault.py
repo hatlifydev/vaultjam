@@ -502,6 +502,20 @@ class Vault:
     def open_reader(self, entry_id: str) -> "ChunkReader":
         return ChunkReader(self, self._entries[entry_id])
 
+    def availability(self, refresh: bool = False) -> dict[str, bool] | None:
+        """Solo almacenes remotos: qué elementos tienen TODOS sus chunks ya
+        disponibles (p.ej. con una subida a Drive aún en curso). None si el
+        almacén no lo soporta (local: siempre completo)."""
+        if not hasattr(self.store, "available_blobs"):
+            return None
+        if refresh and hasattr(self.store, "refresh"):
+            self.store.refresh()
+        avail = self.store.available_blobs()
+        return {
+            e.id: all(c in avail for c in e.chunks)
+            for e in self._entries.values()
+        }
+
     def export_file(self, entry_id: str, dst_dir: Path) -> Path:
         """Descifra a disco. SOLO se llama por acción explícita del usuario;
         la UI advierte de que el resultado queda en claro."""

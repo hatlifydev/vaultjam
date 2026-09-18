@@ -65,6 +65,24 @@ class _ImportWorker(QThread):
         self.finished_ok.emit(ok, errors)
 
 
+class _AvailWorker(QThread):
+    """Consulta en segundo plano qué elementos están completos en Drive
+    (solo listados de carpetas, sin descargar contenido)."""
+
+    done = Signal(object)   # dict[id, bool] | Exception
+
+    def __init__(self, vault: Vault, refresh: bool, parent=None):
+        super().__init__(parent)
+        self._vault = vault
+        self._refresh = refresh
+
+    def run(self):
+        try:
+            self.done.emit(self._vault.availability(refresh=self._refresh))
+        except Exception as e:  # noqa: BLE001
+            self.done.emit(e)
+
+
 class _InactivityFilter(QObject):
     """Cualquier actividad de teclado/ratón en la app rearma el temporizador
     de auto-bloqueo."""
@@ -171,6 +189,7 @@ class MainWindow(QMainWindow):
         QApplication.instance().installEventFilter(self._filter)
         self._reset_autolock()
 
+        self._avail_worker: _AvailWorker | None = None
         if vault.read_only:
             # Bóveda remota (Google Drive): ver, reproducir por streaming y
             # exportar. Todo lo que escribe queda deshabilitado.
@@ -178,9 +197,43 @@ class MainWindow(QMainWindow):
                       self._act_newfolder, self._act_move):
                 a.setEnabled(False)
             self.setWindowTitle("VaultJam — remota (solo lectura)")
+            self._act_check = tb.addAction("🔄 Verificar Drive",
+                                           lambda: self._check_availability(refresh=True))
+            self._act_check.setToolTip(
+                "Comprobar qué elementos ya tienen todos sus chunks en Drive "
+                "(marco verde = completo, rojo = subida incompleta)")
 
         self._reload_sidebar(select=None)
         self._update_status()
+        if vault.read_only:
+            self._check_availability(refresh=False)   # chequeo inicial
+
+    # ---------------- disponibilidad remota ----------------
+
+    def _check_availability(self, refresh: bool = False):
+        if not self._vault.read_only or self._avail_worker is not None:
+            return
+        self.statusBar().showMessage("Comprobando disponibilidad en Drive…")
+        if hasattr(self, "_act_check"):
+            self._act_check.setEnabled(False)
+        self._avail_worker = w = _AvailWorker(self._vault, refresh, self)
+        w.done.connect(self._on_availability)
+        w.start()
+
+    def _on_availability(self, result):
+        self._avail_worker = None
+        if hasattr(self, "_act_check"):
+            self._act_check.setEnabled(True)
+        if self._vault.is_locked:
+            return
+        if isinstance(result, dict):
+            self._gallery.set_availability(result)
+            ok = sum(1 for v in result.values() if v)
+            self.statusBar().showMessage(
+                f"Drive: {ok} de {len(result)} elementos completos "
+                "(verde = listo, rojo = aún subiéndose) · 🔄 para re-comprobar")
+        elif result is not None:
+            self.statusBar().showMessage(f"No se pudo comprobar Drive: {result}")
 
     # ---------------- carpetas ----------------
 

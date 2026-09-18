@@ -8,8 +8,9 @@ como QPixmap en RAM. Al bloquear la bóveda, el modelo se vacía por completo
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QSize, Qt, QThread, Signal
-from PySide6.QtGui import (QColor, QImage, QPainter, QPixmap, QPolygonF,
-                           QStandardItem, QStandardItemModel, QTransform)
+from PySide6.QtGui import (QColor, QImage, QPainter, QPen, QPixmap,
+                           QPolygonF, QStandardItem, QStandardItemModel,
+                           QTransform)
 from PySide6.QtWidgets import QListView, QMenu, QVBoxLayout, QWidget
 
 from ..vault import Vault
@@ -110,6 +111,10 @@ class GalleryWidget(QWidget):
         lay.addWidget(self._view)
         self._masters: dict[str, QPixmap] = {}   # miniaturas a resolución completa
         self._base = 160                         # tamaño base del slider
+        # Disponibilidad remota por elemento (subidas a Drive en curso):
+        # True = todos sus chunks presentes (marco verde), False = aún
+        # incompleto (marco rojo), ausente = sin información (sin marco).
+        self._avail: dict[str, bool] = {}
         self.set_zoom(160)
 
     # ------------------------------------------------------------------
@@ -145,8 +150,24 @@ class GalleryWidget(QWidget):
                        Qt.TransformationMode.SmoothTransformation)
         if item.data(Qt.ItemDataRole.UserRole + 1) == "video":
             pm = _overlay_play(pm)
+        state = self._avail.get(item.data(Qt.ItemDataRole.UserRole))
+        if state is not None:
+            # Marco de disponibilidad remota: verde = completo en Drive,
+            # rojo = a este elemento aún le faltan chunks por subir.
+            pm = QPixmap(pm)   # copia propia antes de pintar encima
+            p = QPainter(pm)
+            p.setPen(QPen(QColor("#27ae60") if state else QColor("#e74c3c"), 6))
+            p.drawRect(pm.rect().adjusted(3, 3, -3, -3))
+            p.end()
         item.setIcon(pm)
         item.setSizeHint(QSize(target + 24, target + 46))
+
+    def set_availability(self, status: dict[str, bool]):
+        """Aplica (y recuerda para futuras recargas) la disponibilidad
+        remota de cada elemento, repintando los marcos en sitio."""
+        self._avail = dict(status)
+        for row in range(self._model.rowCount()):
+            self._apply_pixmap(self._model.item(row))
 
     def refresh_meta(self, vault: Vault):
         """Sincroniza EN SITIO lo que pudo cambiar (⭐, rotación y tamaño de
@@ -166,7 +187,9 @@ class GalleryWidget(QWidget):
     def load(self, vault: Vault, folder: str | None = None, favorites: bool = False):
         """folder=None muestra todo; "" solo lo sin carpeta; favorites=True
         solo los marcados con ⭐ (ignora la carpeta)."""
-        self.clear_secure()
+        avail = self._avail          # la disponibilidad remota sobrevive a
+        self.clear_secure()          # las recargas (solo se borra al bloquear)
+        self._avail = avail
         self._vault = vault
         entries = vault.entries(None if favorites else folder, favorites=favorites)
         for e in entries:
@@ -245,4 +268,5 @@ class GalleryWidget(QWidget):
             self._loader = None
         self._model.clear()
         self._masters.clear()   # soltar los pixmaps descifrados
+        self._avail = {}
         self._vault = None

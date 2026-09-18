@@ -289,6 +289,35 @@ class _FakeRemoteStore:
     def read(self, blob_id):
         return (self.root / "blobs" / blob_id[:2] / f"{blob_id}.blob").read_bytes()
 
+    def available_blobs(self):
+        return {p.stem for p in (self.root / "blobs").rglob("*.blob")}
+
+    def refresh(self):
+        pass
+
+
+def test_remote_availability_flags(tmp_path, vault):
+    """Con una subida a medias, los elementos incompletos deben detectarse
+    sin descargar contenido (solo inventario de blobs presentes)."""
+    ev = vault.import_file(make_big_file(tmp_path), "video", None)   # 3 chunks
+    ep = _import(vault, make_photo(tmp_path))
+    vault.lock()
+    store = _FakeRemoteStore(tmp_path / "v.vault")
+    rv = Vault.open_remote(store, PW)
+
+    st = rv.availability()
+    assert st == {ev.id: True, ep.id: True}
+
+    # simular que a un video aún le falta un chunk por subir
+    missing = rv.get(ev.id).chunks[1]
+    (tmp_path / "v.vault" / "blobs" / missing[:2] / f"{missing}.blob").unlink()
+    st = rv.availability(refresh=True)
+    assert st[ev.id] is False and st[ep.id] is True
+
+    # una bóveda local no reporta disponibilidad (siempre completa)
+    v2 = Vault.open(tmp_path / "v.vault", PW)
+    assert v2.availability() is None
+
 
 def test_remote_readonly_streaming_and_guards(tmp_path, vault):
     src = make_big_file(tmp_path)

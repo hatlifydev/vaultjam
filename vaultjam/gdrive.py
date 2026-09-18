@@ -135,6 +135,24 @@ class DriveStore:
                 _, done = dl.next_chunk()
             return buf.getvalue()
 
+    def refresh(self) -> None:
+        """Descarta los listados cacheados: la próxima consulta verá el
+        estado actual de Drive (útil mientras una subida sigue en curso)."""
+        with self._lock:
+            self._children.clear()
+
+    def available_blobs(self) -> set[str]:
+        """Ids de los blobs YA presentes en Drive. Solo lee metadata
+        (listados de carpetas), no descarga contenido: sirve para marcar
+        qué elementos están completos mientras una subida va a medias."""
+        out: set[str] = set()
+        for name, fid in self._list(self._blobs_id).items():
+            if len(name) == 2:   # subcarpetas de prefijo xx/
+                for child in self._list(fid):
+                    if child.endswith(".blob"):
+                        out.add(child[:-5])
+        return out
+
     # ---- interfaz que consume Vault ----
 
     def read_header(self) -> bytes:
