@@ -170,12 +170,12 @@ class GalleryWidget(QWidget):
             pm = _overlay_play(pm)
         state = self._avail.get(item.data(Qt.ItemDataRole.UserRole))
         if state is not None:
-            # Marco de disponibilidad remota: verde = completo en Drive,
-            # rojo = a este elemento aún le faltan chunks por subir.
+            # Marco de disponibilidad: verde = completo en Drive, rojo =
+            # aún le faltan chunks. Fino (2 px), que no tape la miniatura.
             pm = QPixmap(pm)   # copia propia antes de pintar encima
             p = QPainter(pm)
-            p.setPen(QPen(QColor("#27ae60") if state else QColor("#e74c3c"), 6))
-            p.drawRect(pm.rect().adjusted(3, 3, -3, -3))
+            p.setPen(QPen(QColor("#27ae60") if state else QColor("#e74c3c"), 2))
+            p.drawRect(pm.rect().adjusted(1, 1, -1, -1))
             p.end()
         item.setIcon(pm)
         item.setSizeHint(QSize(target + 24, target + 46))

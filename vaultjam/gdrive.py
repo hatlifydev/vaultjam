@@ -163,15 +163,31 @@ class DriveStore:
             self._children.clear()
 
     def available_blobs(self) -> set[str]:
-        """Ids de los blobs YA presentes en Drive. Solo lee metadata
-        (listados de carpetas), no descarga contenido: sirve para marcar
-        qué elementos están completos mientras una subida va a medias."""
+        """Ids de los blobs YA presentes en Drive. Solo lee metadata, y en
+        LOTES: una consulta puede abarcar ~40 subcarpetas a la vez
+        («'a' in parents or 'b' in parents …»), así que una bóveda de 40k
+        blobs necesita ~45 peticiones en vez de ~300."""
+        subs = [fid for name, fid in self._list(self._blobs_id).items()
+                if len(name) == 2]
         out: set[str] = set()
-        for name, fid in self._list(self._blobs_id).items():
-            if len(name) == 2:   # subcarpetas de prefijo xx/
-                for child in self._list(fid):
-                    if child.endswith(".blob"):
-                        out.add(child[:-5])
+        GROUP = 40
+        for i in range(0, len(subs), GROUP):
+            clause = " or ".join(f"'{sid}' in parents"
+                                 for sid in subs[i:i + GROUP])
+            q = f"({clause}) and trashed=false"
+            token = None
+            while True:
+                with self._lock:
+                    res = self._svc.files().list(
+                        q=q, fields="nextPageToken,files(name)",
+                        pageSize=1000, pageToken=token).execute()
+                for f in res.get("files", []):
+                    n = f["name"]
+                    if n.endswith(".blob"):
+                        out.add(n[:-5])
+                token = res.get("nextPageToken")
+                if not token:
+                    break
         return out
 
     # ---- interfaz que consume Vault ----

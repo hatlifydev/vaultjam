@@ -46,6 +46,11 @@ class MemOps:
         return {d["name"]: {"id": i, "size": (None if d["folder"] else len(d["data"]))}
                 for i, d in self.nodes.items() if d["parent"] == folder_id}
 
+    def list_children_many(self, parent_ids):
+        parents = set(parent_ids)
+        return {d["name"]: {"id": i, "size": (None if d["folder"] else len(d["data"]))}
+                for i, d in self.nodes.items() if d["parent"] in parents}
+
     def upload(self, parent_id, name, path, existing_id=None):
         data = Path(path).read_bytes()
         if existing_id:

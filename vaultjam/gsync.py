@@ -78,6 +78,31 @@ class DriveOps:
                 break
         return out
 
+    def list_children_many(self, parent_ids: list[str]) -> dict[str, dict]:
+        """Hijos de VARIAS carpetas en lotes («'a' in parents or …»): para
+        inventariar miles de blobs con decenas de peticiones, no cientos.
+        Los nombres de blob son únicos (128 bits), así que no hace falta
+        saber de qué subcarpeta vino cada uno."""
+        out: dict[str, dict] = {}
+        GROUP = 40
+        for i in range(0, len(parent_ids), GROUP):
+            clause = " or ".join(f"'{p}' in parents"
+                                 for p in parent_ids[i:i + GROUP])
+            q = f"({clause}) and trashed=false"
+            token = None
+            while True:
+                res = self._svc.files().list(
+                    q=q, fields="nextPageToken,files(id,name,size)",
+                    pageSize=1000, pageToken=token
+                ).execute(num_retries=self.RETRIES)
+                for f in res.get("files", []):
+                    size = int(f["size"]) if f.get("size") is not None else None
+                    out[f["name"]] = {"id": f["id"], "size": size}
+                token = res.get("nextPageToken")
+                if not token:
+                    break
+        return out
+
     def upload(self, parent_id: str, name: str, path: Path,
                existing_id: str | None = None) -> str:
         from googleapiclient.http import MediaFileUpload
@@ -133,14 +158,13 @@ class DriveSyncer:
                      if m.get("size") == EXPECTED_BLOB_SIZE}
 
     def _inventory(self, blobs_id: str) -> tuple[dict[str, dict], dict[str, str]]:
-        remote: dict[str, dict] = {}
-        sub_ids: dict[str, str] = {}
-        for name, meta in self.ops.list_children(blobs_id).items():
-            if len(name) == 2:
-                sub_ids[name] = meta["id"]
-                for child, m2 in self.ops.list_children(meta["id"]).items():
-                    if child.endswith(".blob"):
-                        remote[child[:-5]] = m2
+        sub_ids = {name: meta["id"]
+                   for name, meta in self.ops.list_children(blobs_id).items()
+                   if len(name) == 2}
+        remote = {child[:-5]: m2
+                  for child, m2 in
+                  self.ops.list_children_many(list(sub_ids.values())).items()
+                  if child.endswith(".blob")}
         return remote, sub_ids
 
     def sync(self, progress=lambda done, total: None,
