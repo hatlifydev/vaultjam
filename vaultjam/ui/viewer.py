@@ -420,13 +420,13 @@ class ViewerWindow(QDialog):
 
         self._rate = 1.0
         btn_slower = QPushButton("−")
-        btn_slower.setFixedWidth(28)
+        btn_slower.setFixedWidth(34)
         btn_slower.setToolTip("Velocidad −0.25× (tecla −)")
         btn_slower.clicked.connect(lambda: self._change_rate(-0.25))
         self._rate_lbl = QLabel("1.00×")
         self._rate_lbl.setToolTip("Velocidad (teclas + / −)")
         btn_faster = QPushButton("+")
-        btn_faster.setFixedWidth(28)
+        btn_faster.setFixedWidth(34)
         btn_faster.setToolTip("Velocidad +0.25× (tecla +)")
         btn_faster.clicked.connect(lambda: self._change_rate(+0.25))
 
@@ -466,6 +466,14 @@ class ViewerWindow(QDialog):
         btn_fs.setToolTip("Pantalla completa (tecla F; Esc para salir)")
         btn_fs.clicked.connect(self.toggle_fullscreen)
 
+        # Todos los botones de control son iconos compactos: la marca
+        # iconbtn quita el relleno lateral del tema para que el glifo no se
+        # recorte en un botón estrecho (+ / − quedaban invisibles).
+        for b in (self._btn_play, btn_fback, btn_ffwd, btn_slower, btn_faster,
+                  self._btn_repeat, btn_mark, btn_shot, btn_sthumb,
+                  self._btn_clip, self._btn_mute, btn_fs):
+            b.setProperty("iconbtn", "true")
+
         vbar = QHBoxLayout()
         vbar.setContentsMargins(6, 0, 6, 2)
         for w in (self._btn_play, btn_fback, btn_ffwd):
@@ -482,6 +490,7 @@ class ViewerWindow(QDialog):
         # botón de pantalla completa también para fotos (fila 1 de ajustes)
         btn_fs2 = QPushButton("⛶")
         btn_fs2.setFixedWidth(34)
+        btn_fs2.setProperty("iconbtn", "true")
         btn_fs2.setToolTip("Pantalla completa (tecla F; Esc para salir)")
         btn_fs2.clicked.connect(self.toggle_fullscreen)
         self._adjust.addWidget(btn_fs2)

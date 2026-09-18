@@ -54,6 +54,9 @@ QPushButton:hover {{ background: #303442; }}
 QPushButton:pressed {{ background: {ACCENT_DIM}; }}
 QPushButton:disabled {{ color: {TEXT_DIM}; background: {SURFACE}; }}
 QPushButton:flat {{ background: transparent; }}
+/* Botones-icono compactos (barra del visor): sin relleno lateral, para
+   que un glifo como + o − no quede recortado en un boton estrecho. */
+QPushButton[iconbtn="true"] {{ padding: 4px 0; min-width: 0; font-size: 12pt; }}
 
 QLineEdit, QComboBox {{
     background: {SURFACE};

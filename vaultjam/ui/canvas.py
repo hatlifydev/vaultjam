@@ -336,15 +336,18 @@ class AdjustBar(QWidget):
         btn_rot = QPushButton("↻")
         btn_rot.setToolTip("Girar 90°")
         btn_rot.setFixedWidth(36)
+        btn_rot.setProperty("iconbtn", "true")
         btn_rot.clicked.connect(canvas.rotate_cw)
 
         btn_fh = QPushButton("⇋")
         btn_fh.setToolTip("Espejo horizontal (se recuerda por elemento)")
         btn_fh.setFixedWidth(36)
+        btn_fh.setProperty("iconbtn", "true")
         btn_fh.clicked.connect(canvas.toggle_flip_h)
         btn_fv = QPushButton("⇵")
         btn_fv.setToolTip("Espejo vertical (se recuerda por elemento)")
         btn_fv.setFixedWidth(36)
+        btn_fv.setProperty("iconbtn", "true")
         btn_fv.clicked.connect(canvas.toggle_flip_v)
 
         self._zoom = slider(100, int(ZOOM_MAX * 100), 100,
