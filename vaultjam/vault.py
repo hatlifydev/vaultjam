@@ -546,14 +546,16 @@ class Vault:
             e.flip_v = bool(flip_v)
             self._save_index()
 
-    def read_thumb(self, entry_id: str) -> bytes | None:
+    def read_thumb(self, entry_id: str, background: bool = False) -> bytes | None:
+        """background=True marca la lectura como de FONDO: en almacenes
+        remotos cede el paso a los chunks de video (el video manda)."""
         keys = self._require_keys()
         e = self._entries[entry_id]
         if e.thumb is None:
             return None
-        payload = cc.open_sealed(
-            keys.thumbs, self.store.read(e.thumb), cc.thumb_aad(e.file_id)
-        )
+        read_bg = getattr(self.store, "read_bg", None) if background else None
+        raw = read_bg(e.thumb) if read_bg else self.store.read(e.thumb)
+        payload = cc.open_sealed(keys.thumbs, raw, cc.thumb_aad(e.file_id))
         (ln,) = struct.unpack(">I", payload[:4])
         return payload[4 : 4 + ln]
 
@@ -700,6 +702,7 @@ class ChunkReader:
         self._cache: OrderedDict[int, bytes] = OrderedDict()
         self._cache_max = cache_chunks
         self._mutex = threading.Lock()
+        self._last_idx: int | None = None   # detectar saltos de reproducción
 
     @property
     def size(self) -> int:
@@ -711,6 +714,13 @@ class ChunkReader:
             self._cache.move_to_end(idx)
             return cached
         e = self._entry
+        # Salto de reproducción: cancelar las pre-cargas del punto antiguo
+        # para que TODO el ancho de banda vaya al nuevo punto.
+        if self._last_idx is not None and abs(idx - self._last_idx) > 1:
+            cancel = getattr(self._store, "cancel_prefetch", None)
+            if cancel is not None:
+                cancel()
+        self._last_idx = idx
         sealed = self._store.read(e.chunks[idx])
         # AAD = (archivo, posición, total): un blob movido de sitio o de
         # archivo NO descifra. La integridad se comprueba chunk a chunk,
@@ -764,6 +774,43 @@ class ChunkReader:
 
     def tell(self) -> int:
         return self._pos
+
+    def prefetch_ahead(self, n: int = 8) -> None:
+        """Mantiene la ventana de pre-carga llena desde la posición actual.
+        El visor lo invoca cada segundo: así el buffer sigue creciendo
+        AUNQUE el video esté en pausa, y tras un salto la ventana sigue al
+        nuevo punto. Idempotente (la caché y el dedup lo hacen barato)."""
+        pf = getattr(self._store, "prefetch", None)
+        if pf is None:
+            return
+        idx = self._pos // cc.CHUNK_SIZE
+        ids = self._entry.chunks[idx + 1: idx + 1 + n]
+        if ids:
+            pf(ids)
+
+    def buffered_ranges(self) -> list[tuple[float, float]]:
+        """Tramos [0..1] del video ya descargados en esta sesión, para
+        pintar el mapa de buffer en la barra de avance. En almacenes
+        locales todo está 'cargado'."""
+        total = self._entry.total_chunks
+        if not total:
+            return []
+        down = getattr(self._store, "downloaded", None)
+        if down is None:
+            return [(0.0, 1.0)]
+        have = sorted(set(self._cache) |
+                      {i for i, c in enumerate(self._entry.chunks) if c in down})
+        ranges: list[tuple[float, float]] = []
+        start = prev = None
+        for i in have:
+            if prev is None or i != prev + 1:
+                if start is not None:
+                    ranges.append((start / total, (prev + 1) / total))
+                start = i
+            prev = i
+        if start is not None:
+            ranges.append((start / total, (prev + 1) / total))
+        return ranges
 
     def close(self) -> None:
         with self._mutex:

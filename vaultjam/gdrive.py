@@ -107,6 +107,32 @@ def find_vaults(service) -> list[tuple[str, str]]:
     return sorted((f["name"], f["id"]) for f in res.get("files", []))
 
 
+class _PriorityGate:
+    """EL VIDEO MANDA: las descargas de primer plano (chunks del
+    reproductor y su pre-carga) tienen prioridad absoluta; las de fondo
+    (miniaturas) esperan a que no haya ninguna activa. Sin esto, abrir un
+    video con la galería aún cargando lo dejaba a la cola."""
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._fg = 0
+
+    def enter_fg(self):
+        with self._cv:
+            self._fg += 1
+
+    def exit_fg(self):
+        with self._cv:
+            self._fg -= 1
+            if self._fg <= 0:
+                self._cv.notify_all()
+
+    def wait_for_fg_idle(self):
+        with self._cv:
+            while self._fg > 0:
+                self._cv.wait(0.5)
+
+
 class DriveStore:
     """Almacén de blobs sobre Drive con la misma interfaz de lectura que el
     BlobStore local (`read(blob_id)`), más header/índice.
@@ -134,6 +160,10 @@ class DriveStore:
         self._cache_max = cache_blobs
         self._inflight: set[str] = set()      # pre-cargas en vuelo (dedup)
         self._prefetch_pool = None
+        self._pf_gen = 0                      # generación: saltar => cancelar
+        self._gate = _PriorityGate()          # video antes que miniaturas
+        self.downloaded: set[str] = set()     # bajados en la sesión (mapa
+                                              # de buffer de la barra)
         # Con fábrica de servicios, las descargas pueden ir EN PARALELO
         # (miniaturas, video y previews a la vez, sin cola única).
         self.parallel_reads = 6 if service_factory else 1
@@ -204,10 +234,21 @@ class DriveStore:
                 if b in self._cache or b in self._inflight:
                     continue
                 self._inflight.add(b)
-            self._prefetch_pool.submit(self._prefetch_one, b)
+                gen = self._pf_gen
+            self._prefetch_pool.submit(self._prefetch_one, b, gen)
 
-    def _prefetch_one(self, blob_id: str) -> None:
+    def cancel_prefetch(self) -> None:
+        """Invalida las pre-cargas pendientes (el usuario saltó a otro
+        punto): las encoladas se descartan al arrancar; las ya en vuelo
+        terminan su blob (~1 MiB) y quedan en caché por si acaso."""
+        with self._lock:
+            self._pf_gen += 1
+
+    def _prefetch_one(self, blob_id: str, gen: int) -> None:
         try:
+            with self._lock:
+                if gen != self._pf_gen:
+                    return          # obsoleta: el video ya está en otro punto
             self.read(blob_id)      # read() cachea el resultado
         except Exception:
             pass                    # la lectura real reintentará y avisará
@@ -257,7 +298,7 @@ class DriveStore:
     def read_index(self) -> bytes:
         return self._download(self._root["index.enc"])
 
-    def read(self, blob_id: str) -> bytes:
+    def _read_impl(self, blob_id: str) -> bytes:
         with self._lock:
             hit = self._cache.get(blob_id)
             if hit is not None:
@@ -272,6 +313,22 @@ class DriveStore:
         data = self._download(file_id)
         with self._lock:
             self._cache[blob_id] = data
+            self.downloaded.add(blob_id)
             while len(self._cache) > self._cache_max:
                 self._cache.popitem(last=False)
         return data
+
+    def read(self, blob_id: str) -> bytes:
+        """Lectura de PRIMER PLANO (video, export): pasa por delante de
+        cualquier descarga de fondo."""
+        self._gate.enter_fg()
+        try:
+            return self._read_impl(blob_id)
+        finally:
+            self._gate.exit_fg()
+
+    def read_bg(self, blob_id: str) -> bytes:
+        """Lectura de FONDO (miniaturas): cede el paso mientras el video
+        esté descargando. Con el video en pausa o al día, avanza normal."""
+        self._gate.wait_for_fg_idle()
+        return self._read_impl(blob_id)

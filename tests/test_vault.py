@@ -286,12 +286,18 @@ class _FakeRemoteStore:
     def __init__(self, root):
         self.root = Path(root)
         self.prefetched: list = []
+        self.downloaded: set = set()
+        self.cancels = 0
 
     def read(self, blob_id):
+        self.downloaded.add(blob_id)
         return (self.root / "blobs" / blob_id[:2] / f"{blob_id}.blob").read_bytes()
 
     def prefetch(self, blob_ids):
         self.prefetched.extend(blob_ids)
+
+    def cancel_prefetch(self):
+        self.cancels += 1
 
     def available_blobs(self):
         return {p.stem for p in (self.root / "blobs").rglob("*.blob")}
@@ -346,8 +352,21 @@ def test_remote_readonly_streaming_and_guards(tmp_path, vault):
     # lectura adelantada: al tocar el chunk 1, se pidieron los siguientes
     assert store.prefetched, "el lector no pre-cargó chunks"
     assert set(store.prefetched) <= set(rv.get(ev.id).chunks)
+    # mapa de buffer: por ahora solo está bajado el chunk central (1 de 3)
+    assert r.buffered_ranges() == [(1 / 3, 2 / 3)]
+    # salto de reproducción: a un chunk VECINO no cancela; a uno lejano sí
+    r.seek(0)
+    r.read(5)                              # 1 -> 0: vecino
+    cancels0 = store.cancels
+    r.seek(2 * cc.CHUNK_SIZE + 1)
+    r.read(5)                              # 0 -> 2: salto detectado
+    assert store.cancels > cancels0, "el salto no canceló pre-cargas"
+    # prefetch_ahead es idempotente y respeta la ventana
+    r.prefetch_ahead(2)
+    assert set(store.prefetched) <= set(rv.get(ev.id).chunks)
     r.seek(0)
     assert r.read(-1) == original
+    assert r.buffered_ranges() == [(0.0, 1.0)]   # ahora sí: entero bajado
     assert rv.read_thumb(ep.id)[:2] == b"\xff\xd8"
     out = tmp_path / "out"
     out.mkdir()
@@ -420,6 +439,34 @@ def test_filter_params_roundtrip():
     assert (q.brightness, q.gamma, q.smooth, q.contrast) == (10, -5, True, 0)
     assert FilterParams().to_dict() == {}
     assert FilterParams.from_dict(None).neutral()
+
+
+def test_priority_gate_video_first():
+    """Las descargas de fondo (miniaturas) esperan a que el primer plano
+    (video) termine: el video manda."""
+    import threading as th
+    import time as tm
+
+    from vaultjam.gdrive import _PriorityGate
+    gate = _PriorityGate()
+    order: list = []
+    gate.enter_fg()                      # video descargando
+
+    def bg():
+        gate.wait_for_fg_idle()
+        order.append("miniatura")
+
+    t = th.Thread(target=bg)
+    t.start()
+    tm.sleep(0.15)
+    order.append("video-listo")
+    gate.exit_fg()                       # el video terminó: paso libre
+    t.join(3)
+    assert order == ["video-listo", "miniatura"]
+    # sin primer plano activo, el fondo no espera nada
+    t0 = tm.monotonic()
+    gate.wait_for_fg_idle()
+    assert tm.monotonic() - t0 < 0.2
 
 
 def test_neutral_filters_do_not_touch_pixels():

@@ -76,7 +76,8 @@ class _ThumbLoader(QThread):
             if self._stop or self._vault.is_locked:
                 return None
             try:
-                data = self._vault.read_thumb(eid)
+                # Lectura de FONDO: en remoto cede el paso al video.
+                data = self._vault.read_thumb(eid, background=True)
             except Exception:
                 return None   # miniatura corrupta: se queda el placeholder
             if not data:

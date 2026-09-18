@@ -111,7 +111,14 @@ class _SeekSlider(QSlider):
         super().__init__(Qt.Orientation.Horizontal)
         self._marks: list[tuple[int, bool, str]] = []  # (ms, ¿rotación?, nombre)
         self._ab: tuple[int, int] | None = None
+        self._buffered: list[tuple[float, float]] = [] # tramos ya descargados
         self.setMouseTracking(True)
+
+    def set_buffered(self, ranges: list[tuple[float, float]]):
+        """Mapa de buffer (remoto): qué tramos del video ya están bajados."""
+        if ranges != self._buffered:
+            self._buffered = list(ranges)
+            self.update()
 
     def set_marks(self, marks: list[tuple[int, bool, str]]):
         self._marks = [(int(t), bool(r), str(lbl)) for t, r, lbl in marks]
@@ -156,6 +163,14 @@ class _SeekSlider(QSlider):
             return
         p = QPainter(self)
         span = self.width() - 8
+        if self._buffered:
+            # Tramos ya descargados: banda clara sobre el riel.
+            h = self.height()
+            for a, b in self._buffered:
+                x0 = 4 + a * span
+                p.fillRect(int(x0), h // 2 - 2,
+                           max(2, int((b - a) * span)), 4,
+                           QColor(255, 255, 255, 60))
         if self._ab is not None:
             xa = 4 + round(self._ab[0] / self.maximum() * span)
             xb = 4 + round(self._ab[1] / self.maximum() * span)
@@ -350,6 +365,13 @@ class ViewerWindow(QDialog):
         self._device: QIODevice | None = None
         self._buffer_data: QByteArray | None = None
         self._tried_buffer_fallback = False
+        self._stream_reader = None            # lector de chunks del video
+        # Rellena la ventana de pre-carga cada segundo: el buffer sigue
+        # creciendo AUNQUE el video esté en pausa, y actualiza el mapa de
+        # tramos descargados de la barra.
+        self._buffer_timer = QTimer(self)
+        self._buffer_timer.setInterval(1000)
+        self._buffer_timer.timeout.connect(self._buffer_tick)
         self._movie: QMovie | None = None       # GIF animados (RAM)
         self._movie_buf: QBuffer | None = None
         self._pending_resume = 0
@@ -1242,9 +1264,19 @@ class ViewerWindow(QDialog):
 
     def _start_streaming(self):
         """Intento 1: streaming con descifrado bajo demanda (ventana ~8 MiB)."""
-        self._device = DecryptingIODevice(self._vault.open_reader(self._entry.id))
+        self._stream_reader = self._vault.open_reader(self._entry.id)
+        self._device = DecryptingIODevice(self._stream_reader)
         self._player.setSourceDevice(self._device, self._source_hint())
         self._player.play()
+        self._pos.set_buffered([])
+        self._buffer_timer.start()
+
+    def _buffer_tick(self):
+        r = self._stream_reader
+        if r is None or self._entry.mime != "video":
+            return
+        r.prefetch_ahead(8)                    # sigue cargando, incluso en pausa
+        self._pos.set_buffered(r.buffered_ranges())
 
     def _fallback_buffer(self):
         """Intento 2: video completo descifrado a RAM (QBuffer)."""
@@ -1258,6 +1290,7 @@ class ViewerWindow(QDialog):
         self._device = buf
         self._player.setSourceDevice(buf, self._source_hint())
         self._player.play()
+        self._pos.set_buffered([(0.0, 1.0)])   # el video entero está en RAM
 
     def _on_error(self, _err, msg: str):
         if self._entry.mime != "video":
@@ -1416,6 +1449,9 @@ class ViewerWindow(QDialog):
     # ------------------------------------------------------------------
 
     def _teardown_source(self):
+        self._buffer_timer.stop()
+        self._stream_reader = None
+        self._pos.set_buffered([])
         self._player.stop()
         self._player.setSource(QUrl())  # desengancha el QIODevice del backend
         if self._device is not None:
