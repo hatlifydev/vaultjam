@@ -101,7 +101,7 @@ class DriveSyncer:
         self.folder_name = folder_name or self.root.name
         self.folder_hint = folder_hint
 
-    def _resolve_folder(self) -> str:
+    def _resolve_folder(self, create: bool = True) -> str:
         # 1) la carpeta usada la última vez, si sigue existiendo
         if self.folder_hint and self.ops.folder_exists(self.folder_hint):
             return self.folder_hint
@@ -113,8 +113,24 @@ class DriveSyncer:
             raise RuntimeError(
                 f"Hay {len(ids)} carpetas llamadas «{self.folder_name}» en tu "
                 "Drive; deja solo una (o vacía la papelera) y reintenta.")
+        if not create:
+            raise RuntimeError(
+                f"No existe todavía un espejo «{self.folder_name}» en Drive: "
+                "sincroniza primero con ☁.")
         # 3) no existe: se crea en la raíz de Mi unidad
         return self.ops.create_folder(None, self.folder_name)
+
+    def mirrored_blobs(self) -> tuple[str, set[str]]:
+        """Solo VERIFICA (no crea ni sube nada): devuelve la carpeta espejo
+        y el conjunto de blobs correctos (tamaño exacto) presentes en Drive.
+        Es la base de los marcos verde/rojo en la bóveda local."""
+        fid = self._resolve_folder(create=False)
+        blobs_meta = self.ops.list_children(fid).get("blobs")
+        if not blobs_meta:
+            return fid, set()
+        remote, _ = self._inventory(blobs_meta["id"])
+        return fid, {b for b, m in remote.items()
+                     if m.get("size") == EXPECTED_BLOB_SIZE}
 
     def _inventory(self, blobs_id: str) -> tuple[dict[str, dict], dict[str, str]]:
         remote: dict[str, dict] = {}
@@ -188,4 +204,5 @@ class DriveSyncer:
         return {"cancelado": False, "subidos": uploaded, "corregidos": corrected,
                 "ya_presentes": len(self.expected) - uploaded,
                 "huerfanos": len(set(remote2) - set(self.expected)),
-                "total": len(self.expected), "folder_id": fid}
+                "total": len(self.expected), "folder_id": fid,
+                "ok_blobs": ok}   # para pintar los marcos verde/rojo

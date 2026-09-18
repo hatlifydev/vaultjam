@@ -100,6 +100,7 @@ def test_sync_full_mirror_and_second_pass(synced):
     assert not s1["cancelado"]
     assert s1["subidos"] == n and s1["ya_presentes"] == 0
     assert s1["huerfanos"] == 0
+    assert s1["ok_blobs"] == set(vault.all_blob_ids())   # para los marcos
 
     # segunda pasada: nada que subir (reanudable e idempotente)
     s2 = DriveSyncer(ops, vault.root, vault.all_blob_ids(),
@@ -144,6 +145,27 @@ def test_sync_cancel_leaves_index_untouched(synced):
                      folder_name="v.vault").sync()
     assert not s2["cancelado"]
     assert s2["subidos"] == s["pendientes"]
+
+
+def test_mirrored_blobs_verify_only(synced):
+    vault, ops, syncer, _ = synced
+    # sin espejo aún: verificar NO debe crear nada
+    with pytest.raises(RuntimeError, match="No existe"):
+        DriveSyncer(ops, vault.root, [], folder_name="v.vault").mirrored_blobs()
+    assert ops.find_folders("v.vault") == []
+    # tras sincronizar: devuelve el inventario correcto
+    s = syncer.sync()
+    fid, ok = DriveSyncer(ops, vault.root, [],
+                          folder_name="v.vault").mirrored_blobs()
+    assert fid == s["folder_id"] and ok == set(vault.all_blob_ids())
+    # un blob a medias (tamaño malo) queda fuera del conjunto «ok»
+    victim_blob = vault.all_blob_ids()[0]
+    victim = next(i for i, d in ops.nodes.items()
+                  if d["name"] == f"{victim_blob}.blob")
+    ops.nodes[victim]["data"] = b"x" * 10
+    _, ok2 = DriveSyncer(ops, vault.root, [],
+                         folder_name="v.vault").mirrored_blobs()
+    assert victim_blob not in ok2 and len(ok2) == len(ok) - 1
 
 
 def test_sync_ambiguous_folder_refuses(synced):

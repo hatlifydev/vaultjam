@@ -105,6 +105,34 @@ class _SyncWorker(QThread):
             self.finished_ok.emit(e)
 
 
+class _MirrorCheckWorker(QThread):
+    """Solo verifica el espejo de Drive de una bóveda LOCAL (listados, sin
+    subir ni crear nada) para pintar los marcos verde/rojo."""
+
+    done = Signal(object)   # (folder_id, set[str]) | Exception
+
+    def __init__(self, secret: str, folder_name: str, hint: str | None,
+                 parent=None):
+        super().__init__(parent)
+        self._secret = secret
+        self._folder_name = folder_name
+        self._hint = hint
+
+    def run(self):
+        try:
+            from pathlib import Path as _P
+
+            from ..gdrive import get_service
+            from ..gsync import DriveOps, DriveSyncer
+            svc = get_service(self._secret, readonly=True)
+            syncer = DriveSyncer(DriveOps(svc), _P("."), [],
+                                 folder_name=self._folder_name,
+                                 folder_hint=self._hint)
+            self.done.emit(syncer.mirrored_blobs())
+        except Exception as e:  # noqa: BLE001
+            self.done.emit(e)
+
+
 class _AvailWorker(QThread):
     """Consulta en segundo plano qué elementos están completos en Drive
     (solo listados de carpetas, sin descargar contenido)."""
@@ -287,7 +315,14 @@ class MainWindow(QMainWindow):
                 "Sube a tu Google Drive los blobs cifrados que falten y "
                 "actualiza el índice (espejo de respaldo/visualización). "
                 "Reanudable y verificado; requiere autorizar escritura.")
+            self._act_mirror = tb.addAction("🔄 Verificar espejo",
+                                            self._check_mirror)
+            self._act_mirror.setToolTip(
+                "Comprobar qué elementos están ya completos en el espejo de "
+                "Drive: marco verde = subido entero, rojo = aún incompleto. "
+                "Solo lee listados; no sube nada.")
         self._sync_worker: _SyncWorker | None = None
+        self._mirror_worker: _MirrorCheckWorker | None = None
 
         self._update_action_states()
         self._reload_sidebar(select=None)
@@ -316,6 +351,51 @@ class MainWindow(QMainWindow):
             self._sync_worker.cancel()
             self._sync_cancel_btn.setEnabled(False)
             self._sync_label.setText("Cancelando… (termina el blob en curso)")
+
+    def _apply_mirror_availability(self, ok_blobs: set):
+        """Pinta los marcos verde/rojo de la bóveda LOCAL según qué blobs
+        están ya completos en el espejo de Drive."""
+        status = {e.id: all(c in ok_blobs for c in e.chunks)
+                  for e in self._vault.entries()}
+        self._gallery.set_availability(status)
+        done = sum(1 for v in status.values() if v)
+        self.statusBar().showMessage(
+            f"Espejo Drive: {done} de {len(status)} elementos completos "
+            "(marco verde = subido, rojo = pendiente)")
+
+    def _check_mirror(self):
+        if self._mirror_worker is not None or self._vault.read_only:
+            return
+        settings = QSettings("VaultJam", "VaultJam")
+        secret = str(settings.value("gdrive_secret", ""))
+        if not secret or not Path(secret).exists():
+            QMessageBox.information(
+                self, "Verificar espejo",
+                "Primero configura tu client_secret.json en la pestaña "
+                "«Google Drive» de la pantalla de desbloqueo (ver README).")
+            return
+        key = f"syncfolder/{self._vault.root}"
+        hint = str(settings.value(key, "")) or None
+        self.statusBar().showMessage("Comprobando el espejo en Drive…")
+        self._act_mirror.setEnabled(False)
+        self._mirror_worker = w = _MirrorCheckWorker(
+            secret, self._vault.root.name, hint, self)
+
+        def done(result):
+            self._mirror_worker = None
+            self._act_mirror.setEnabled(True)
+            if self._vault.is_locked:
+                return
+            if isinstance(result, tuple):
+                fid, ok = result
+                settings.setValue(key, fid)
+                self._apply_mirror_availability(ok)
+            else:
+                self.statusBar().showMessage(
+                    f"No se pudo verificar el espejo: {result}")
+
+        w.done.connect(done)
+        w.start()
 
     def _sync_drive(self):
         if self._sync_worker is not None:
@@ -371,6 +451,9 @@ class MainWindow(QMainWindow):
             self._update_action_states()
             if isinstance(result, dict):
                 settings.setValue(key, result["folder_id"])
+                if "ok_blobs" in result:
+                    # Marcos verde/rojo al día con lo recién verificado.
+                    self._apply_mirror_availability(result["ok_blobs"])
                 if result.get("cancelado"):
                     self.statusBar().showMessage(
                         f"Sincronización cancelada sin peligro: {result['subidos']} "
