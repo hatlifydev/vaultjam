@@ -107,6 +107,7 @@ class UnlockDialog(QDialog):
         tabs = QTabWidget()
         tabs.addTab(self._build_open_tab(), "Abrir bóveda")
         tabs.addTab(self._build_create_tab(), "Crear bóveda nueva")
+        tabs.addTab(self._build_drive_tab(), "Google Drive")
 
         self._status = QLabel("")
         self._status.setWordWrap(True)
@@ -127,7 +128,8 @@ class UnlockDialog(QDialog):
         QTimer.singleShot(0, self._focus_password)
 
     def _focus_password(self, *_):
-        target = self._open_pw if self._tabs.currentIndex() == 0 else self._create_pw
+        idx = self._tabs.currentIndex()
+        target = (self._open_pw, self._create_pw, self._gd_pw)[min(idx, 2)]
         target.setFocus()
         target.selectAll()
 
@@ -244,6 +246,133 @@ class UnlockDialog(QDialog):
         form.addRow(self._btn_create)
         return w
 
+    # ---------------- pestaña Google Drive (remota, solo lectura) ----------------
+
+    def _build_drive_tab(self) -> QWidget:
+        w = QWidget()
+        form = QFormLayout(w)
+
+        self._gd_service = None
+        self._gd_secret = QLineEdit(
+            str(QSettings("VaultJam", "VaultJam").value("gdrive_secret", "")))
+        btn_sec = QPushButton("Examinar…")
+        btn_sec.clicked.connect(self._pick_secret)
+        row = QHBoxLayout()
+        row.addWidget(self._gd_secret)
+        row.addWidget(btn_sec)
+        form.addRow("client_secret.json:", row)
+
+        hint = QLabel(
+            "Credencial OAuth de TU proyecto de Google Cloud (tipo "
+            "«Aplicación de escritorio», ver README). Solo se pide permiso "
+            "de LECTURA de Drive; el token queda en %APPDATA%\\VaultJam y "
+            "es revocable en myaccount.google.com/permissions. La bóveda "
+            "remota se abre en solo lectura: ver, reproducir y exportar."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray;")
+        form.addRow(hint)
+
+        btn_conn = QPushButton("Conectar y buscar bóvedas")
+        btn_conn.clicked.connect(self._gd_connect)
+        form.addRow(btn_conn)
+
+        self._gd_combo = QComboBox()
+        form.addRow("Bóveda en Drive:", self._gd_combo)
+
+        self._gd_pw = QLineEdit()
+        self._gd_pw.setEchoMode(QLineEdit.EchoMode.Password)
+        self._gd_pw.returnPressed.connect(self._do_open_remote)
+        form.addRow("Contraseña:", self._gd_pw)
+
+        btn_open = QPushButton("Abrir remota (solo lectura)")
+        btn_open.clicked.connect(self._do_open_remote)
+        btn_forget = QPushButton("Olvidar acceso a Google")
+        btn_forget.setToolTip("Borra el token OAuth guardado en %APPDATA%\\VaultJam")
+        btn_forget.clicked.connect(self._gd_forget)
+        row2 = QHBoxLayout()
+        row2.addWidget(btn_open)
+        row2.addWidget(btn_forget)
+        form.addRow(row2)
+        return w
+
+    def _pick_secret(self):
+        f, _ = QFileDialog.getOpenFileName(
+            self, "Selecciona tu client_secret.json", "", "JSON (*.json)")
+        if f:
+            self._gd_secret.setText(f)
+            QSettings("VaultJam", "VaultJam").setValue("gdrive_secret", f)
+
+    def _gd_forget(self):
+        from ..gdrive import forget_token
+        forget_token()
+        self._gd_service = None
+        self._gd_combo.clear()
+        QMessageBox.information(
+            self, "Google Drive",
+            "Token borrado. Para revocar del todo el acceso, visita "
+            "myaccount.google.com/permissions.")
+
+    def _gd_connect(self):
+        secret = self._gd_secret.text().strip()
+        if not secret or not Path(secret).exists():
+            QMessageBox.warning(
+                self, "Google Drive",
+                "Selecciona tu archivo client_secret.json (las instrucciones "
+                "para crearlo están en el README).")
+            return
+        QSettings("VaultJam", "VaultJam").setValue("gdrive_secret", secret)
+        self._busy(True, "Conectando con Google (la primera vez se abre el navegador)…")
+
+        def job():
+            from ..gdrive import find_vaults, get_service
+            svc = get_service(secret)
+            return (svc, find_vaults(svc))
+
+        self._worker = _KdfWorker(job)
+        self._worker.done.connect(self._on_gd_connected)
+        self._worker.start()
+
+    def _on_gd_connected(self, result):
+        self._busy(False)
+        if isinstance(result, tuple):
+            self._gd_service, vaults = result
+            self._gd_combo.clear()
+            for name, fid in vaults:
+                self._gd_combo.addItem(name, fid)
+            if vaults:
+                self._gd_pw.setFocus()
+            else:
+                QMessageBox.information(
+                    self, "Google Drive",
+                    "No se encontraron carpetas *.vault en tu Drive. Sube la "
+                    "carpeta completa de tu bóveda (con header.json, "
+                    "index.enc y blobs/) desde drive.google.com.")
+        else:
+            QMessageBox.critical(self, "Google Drive", f"No se pudo conectar:\n{result}")
+
+    def _do_open_remote(self):
+        if self._gd_service is None or self._gd_combo.count() == 0:
+            QMessageBox.information(
+                self, "Google Drive", "Primero conecta y elige una bóveda.")
+            return
+        pw = self._gd_pw.text()
+        if not pw:
+            return
+        fid = self._gd_combo.currentData()
+        name = self._gd_combo.currentText()
+        svc = self._gd_service
+        self._last_tab = "drive"
+        self._busy(True, "Leyendo la bóveda remota y derivando clave (Argon2id)…")
+
+        def job():
+            from ..gdrive import DriveStore
+            return Vault.open_remote(DriveStore(svc, fid, name), pw)
+
+        self._worker = _KdfWorker(job)
+        self._worker.done.connect(self._on_done)
+        self._worker.start()
+
     # ---------------- acciones ----------------
 
     def _forget_recents(self):
@@ -318,8 +447,10 @@ class UnlockDialog(QDialog):
         self._open_pw.clear()
         self._create_pw.clear()
         self._create_pw2.clear()
+        self._gd_pw.clear()
         if isinstance(result, Vault):
-            _push_recent(str(result.root))   # recordar la ruta (solo la ruta)
+            if result.root is not None:      # las remotas no tienen ruta local
+                _push_recent(str(result.root))
             self.vault = result
             self.accept()
             return
@@ -329,6 +460,7 @@ class UnlockDialog(QDialog):
             QMessageBox.critical(self, "VaultJam", f"No se pudo abrir/crear la bóveda:\n{result}")
         # Tras el error, el campo de contraseña vuelve a quedar enfocado y
         # listo para reintentar sin tocar el ratón.
-        target = self._open_pw if self._last_tab == "open" else self._create_pw
+        target = {"open": self._open_pw, "create": self._create_pw,
+                  "drive": self._gd_pw}.get(self._last_tab, self._open_pw)
         target.setFocus()
         target.selectAll()

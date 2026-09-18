@@ -118,12 +118,12 @@ class MainWindow(QMainWindow):
         tb = QToolBar("Principal")
         tb.setMovable(False)
         self.addToolBar(tb)
-        tb.addAction("📥 Importar", self._import)
+        self._act_import = tb.addAction("📥 Importar", self._import)
         self._act_export = tb.addAction("📤 Exportar", self._export)
         self._act_delete = tb.addAction("🗑 Eliminar", self._delete)
         tb.addSeparator()
-        tb.addAction("📁 Nueva carpeta", self._new_folder)
-        tb.addAction("📂 Mover a…", self._move_selected)
+        self._act_newfolder = tb.addAction("📁 Nueva carpeta", self._new_folder)
+        self._act_move = tb.addAction("📂 Mover a…", self._move_selected)
         tb.addSeparator()
 
         tb.addWidget(QLabel(" Zoom: "))
@@ -170,6 +170,14 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QApplication
         QApplication.instance().installEventFilter(self._filter)
         self._reset_autolock()
+
+        if vault.read_only:
+            # Bóveda remota (Google Drive): ver, reproducir por streaming y
+            # exportar. Todo lo que escribe queda deshabilitado.
+            for a in (self._act_import, self._act_delete,
+                      self._act_newfolder, self._act_move):
+                a.setEnabled(False)
+            self.setWindowTitle("VaultJam — remota (solo lectura)")
 
         self._reload_sidebar(select=None)
         self._update_status()
@@ -262,8 +270,8 @@ class MainWindow(QMainWindow):
     def _folder_menu(self, pos):
         item = self._sidebar.itemAt(pos)
         folder = item.data(Qt.ItemDataRole.UserRole) if item else None
-        if not folder or folder == FAV_KEY:  # Todo/Sin carpeta/⭐ no se eliminan
-            return
+        if not folder or folder == FAV_KEY or self._vault.read_only:
+            return   # Todo/Sin carpeta/⭐ no se eliminan; remota es solo lectura
         menu = QMenu(self)
         act = menu.addAction(f"Eliminar carpeta «{folder}»")
         if menu.exec(self._sidebar.mapToGlobal(pos)) is act:
@@ -281,7 +289,9 @@ class MainWindow(QMainWindow):
         self._autolock.start(secs * 1000)
 
     def _update_status(self):
-        self.statusBar().showMessage(f"{self._gallery.count()} elementos cifrados en la bóveda")
+        suffix = "  ·  remota Google Drive (solo lectura)" if self._vault.read_only else ""
+        self.statusBar().showMessage(
+            f"{self._gallery.count()} elementos cifrados en la bóveda{suffix}")
 
     def _apply_capture_protection(self, on: bool):
         set_capture_protection(self, on)

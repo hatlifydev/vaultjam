@@ -204,6 +204,8 @@ class GalleryWidget(QWidget):
         ids = self.selected_ids()
         if not ids or self._vault is None:
             return
+        if getattr(self._vault, "read_only", False):
+            return   # bóveda remota: sin favoritos/rotación/tamaño
         menu = QMenu(self)
         act_fav = menu.addAction("⭐ Alternar favorito")
         act_rot = menu.addAction("↻ Girar miniatura 90°")

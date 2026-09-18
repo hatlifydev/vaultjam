@@ -104,6 +104,43 @@ El resultado queda en `dist\VaultJam\VaultJam.exe` (modo carpeta; copia la
 carpeta entera). El spec ya recoge los plugins multimedia de Qt y las DLL de
 ffmpeg de PyAV.
 
+## Bóvedas remotas en Google Drive (solo lectura)
+
+VaultJam puede abrir una bóveda alojada en tu Google Drive y **previsualizar
+miniaturas y reproducir videos por streaming**, descargando solo los chunks
+de 1 MiB que hagan falta y descifrándolos en RAM. Google solo ve ciphertext,
+igual que un disco robado. El modo remoto es de **solo lectura** (ver,
+reproducir, exportar): nada se escribe en Drive, así que no hay riesgo de
+corromper el índice por conflictos.
+
+**1. Sube la bóveda a Drive**: entra en drive.google.com y arrastra la
+carpeta `MiBoveda.vault` completa (con `header.json`, `index.enc` y
+`blobs/`). Para actualizarla después, vuelve a subir/reemplazar `index.enc`
+y los blobs nuevos, o sube una copia con otro nombre.
+
+**2. Crea tu credencial OAuth** (una vez, ~5 minutos — Google lo exige para
+que una app acceda a TU Drive; no hay servidor de terceros involucrado):
+
+1. Ve a [console.cloud.google.com](https://console.cloud.google.com) →
+   crea un proyecto (nombre libre, p. ej. "VaultJam").
+2. «APIs y servicios → Biblioteca» → busca **Google Drive API** → Habilitar.
+3. «Pantalla de consentimiento OAuth» → tipo **Externo** → rellena solo lo
+   obligatorio → en «Usuarios de prueba» añade tu propio Gmail.
+4. «Credenciales → Crear credenciales → ID de cliente de OAuth» → tipo
+   **Aplicación de escritorio** → descarga el JSON (`client_secret_….json`).
+
+**3. En VaultJam**: pestaña «Google Drive» → selecciona ese JSON →
+«Conectar y buscar bóvedas» (la primera vez se abre el navegador para
+autorizar; el permiso es **solo de lectura** de Drive) → elige la bóveda,
+contraseña y «Abrir remota».
+
+Notas honestas: el token OAuth queda en `%APPDATA%\VaultJam\token.json` —
+da lectura de tu Drive a quien lo robe (no de la bóveda, que sigue
+cifrada); el botón «Olvidar acceso» lo borra y puedes revocarlo en
+myaccount.google.com/permissions. Cada miniatura remota descarga 1 MiB
+(el precio del padding anti-metadatos), así que la primera carga de una
+galería grande tarda; los chunks ya vistos se cachean en RAM.
+
 ## Formato del contenedor
 
 ```

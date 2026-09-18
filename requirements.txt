@@ -12,5 +12,10 @@ av>=12.0               # PyAV (ffmpeg) para extraer un fotograma de los videos
 # Filtros del visor (gamma, saturación, nitidez…): LUTs por píxel en RAM
 numpy>=1.26
 
+# Bóvedas remotas en Google Drive (solo lectura; OAuth del propio usuario,
+# scope drive.readonly — el token nunca da permisos de escritura)
+google-api-python-client>=2.100
+google-auth-oauthlib>=1.2
+
 # Desarrollo
 pytest>=8.0

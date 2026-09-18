@@ -269,6 +269,70 @@ def test_thumb_rotation_and_scale_independent(tmp_path, vault):
     assert v2.get(e.id).rotation == 90
 
 
+class _FakeRemoteStore:
+    """Adaptador de pruebas: sirve una bóveda local a través de la interfaz
+    de almacén remoto (read_header/read_index/read), igual que DriveStore.
+    Ejercita todo el camino remoto excepto el transporte HTTP."""
+
+    writable = False
+    name = "prueba-remota"
+
+    def __init__(self, root):
+        self.root = Path(root)
+
+    def read_header(self):
+        return (self.root / "header.json").read_bytes()
+
+    def read_index(self):
+        return (self.root / "index.enc").read_bytes()
+
+    def read(self, blob_id):
+        return (self.root / "blobs" / blob_id[:2] / f"{blob_id}.blob").read_bytes()
+
+
+def test_remote_readonly_streaming_and_guards(tmp_path, vault):
+    src = make_big_file(tmp_path)
+    ev = vault.import_file(src, "video", None)
+    ep = _import(vault, make_photo(tmp_path))
+    vault.set_marks(ev.id, [[1000, "x", 90]])
+    vault.lock()
+
+    store = _FakeRemoteStore(tmp_path / "v.vault")
+    with pytest.raises(cc.VaultCryptoError):
+        Vault.open_remote(store, "incorrecta")
+    rv = Vault.open_remote(store, PW)
+    assert rv.read_only and rv.root is None
+    assert {x.id for x in rv.entries()} == {ev.id, ep.id}
+    assert rv.get(ev.id).marks == [[1000, "x", 90]]
+
+    # streaming con seek + miniaturas + exportar: permitidos e íntegros
+    original = src.read_bytes()
+    r = rv.open_reader(ev.id)
+    r.seek(cc.CHUNK_SIZE + 7)
+    assert r.read(50) == original[cc.CHUNK_SIZE + 7: cc.CHUNK_SIZE + 57]
+    r.seek(0)
+    assert r.read(-1) == original
+    assert rv.read_thumb(ep.id)[:2] == b"\xff\xd8"
+    out = tmp_path / "out"
+    out.mkdir()
+    assert rv.export_file(ev.id, out).read_bytes() == original
+
+    # escrituras estructurales: prohibidas con error claro
+    with pytest.raises(VaultError):
+        rv.import_file(src, "video", None)
+    with pytest.raises(VaultError):
+        rv.create_folder("X")
+    with pytest.raises(VaultError):
+        rv.delete_file(ev.id)
+    # metadata de sesión: no-op silencioso (el visor no debe romperse)
+    rv.set_marks(ev.id, [])
+    rv.set_favorite(ep.id, True)
+    rv.set_resume(ev.id, 999)
+    assert rv.get(ev.id).marks == [[1000, "x", 90]]
+    assert rv.get(ep.id).favorite is False
+    assert rv.get(ev.id).resume_ms == 0
+
+
 def test_folder_validation(tmp_path, vault):
     with pytest.raises(VaultError):
         vault.create_folder("con/barra")

@@ -584,6 +584,8 @@ class ViewerWindow(QDialog):
         self._osd(f"↻ {rot}°")
 
     def _toggle_favorite(self):
+        if self._read_only_notice():
+            return
         fav = not self._entry.favorite
         self._vault.set_favorite(self._entry.id, fav)
         self._update_title()
@@ -593,8 +595,15 @@ class ViewerWindow(QDialog):
     # Marcadores con nombre
     # ------------------------------------------------------------------
 
+    def _read_only_notice(self) -> bool:
+        """True (y avisa) si la bóveda es remota: la metadata no persiste."""
+        if self._vault.read_only:
+            self._osd("Bóveda remota: solo lectura")
+            return True
+        return False
+
     def _add_mark(self):
-        if self._entry.mime != "video":
+        if self._entry.mime != "video" or self._read_only_notice():
             return
         pos = int(self._player.position())
         self._vault.set_marks(self._entry.id, list(self._entry.marks) + [[pos, "", None]])
@@ -705,11 +714,15 @@ class ViewerWindow(QDialog):
     def _cycle_mark_rotation(self, t: int, rot: int | None):
         """Icono ↻ del chip: cicla la rotación del segmento en pasos de 90°
         (sin rotación → 90 → 180 → 270 → 0 → sin rotación)."""
+        if self._read_only_notice():
+            return
         order = [None, 90, 180, 270, 0]
         nxt = order[(order.index(rot) + 1) % len(order)]
         self._set_mark_rotation(t, nxt)
 
     def _mark_menu(self, chip: QPushButton, pos, t: int, label: str, rot: int | None):
+        if self._read_only_notice():
+            return
         menu = QMenu(self)
         act_ren = menu.addAction("Renombrar…")
         act_unrot = menu.addAction("Quitar la rotación del segmento") if rot is not None else None

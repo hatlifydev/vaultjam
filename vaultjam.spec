@@ -9,11 +9,14 @@
 #  - Los hooks oficiales recogen los plugins de Qt (multimedia incluido) y
 #    las DLL de ffmpeg que usa PyAV.
 
+from PyInstaller.utils.hooks import collect_data_files
+
 a = Analysis(
     ["run_app.py"],
     pathex=[],
     binaries=[],
-    datas=[],
+    # googleapiclient necesita sus documentos de descubrimiento empaquetados
+    datas=collect_data_files("googleapiclient"),
     hiddenimports=["av"],
     hookspath=[],
     runtime_hooks=[],

@@ -74,9 +74,12 @@ class FileEntry:
 class Vault:
     """Una bóveda abierta. Crear con Vault.create() o Vault.open()."""
 
-    def __init__(self, root: Path):
-        self.root = Path(root)
-        self.store = BlobStore(self.root)
+    def __init__(self, root: Path | None, store=None, read_only: bool = False):
+        # root=None + store => bóveda remota (p.ej. Google Drive). El store
+        # solo necesita read(blob_id); en remoto, además read_header/read_index.
+        self.root = Path(root) if root is not None else None
+        self.store = store if store is not None else BlobStore(self.root)
+        self.read_only = bool(read_only)
         self._mk: bytearray | None = None
         self._keys: cc.SubKeys | None = None
         self._entries: dict[str, FileEntry] = {}
@@ -129,18 +132,14 @@ class Vault:
         v._save_index()
         return v
 
-    @classmethod
-    def open(cls, root: Path, password: str) -> "Vault":
-        root = Path(root)
-        try:
-            header = json.loads((root / HEADER_NAME).read_text())
-        except (OSError, ValueError) as e:
-            raise VaultError("No es una bóveda válida (header ilegible).") from e
+    @staticmethod
+    def _unlock_mk(header: dict, password: str) -> bytearray:
+        """Valida el header y desenvuelve la clave maestra. Común a bóvedas
+        locales y remotas: la criptografía es idéntica venga de donde venga."""
         if header.get("magic") != cc.MAGIC:
             raise VaultError("No es una bóveda válida.")
         if header.get("version") != cc.VERSION:
             raise VaultError("Versión de bóveda no soportada por esta app.")
-
         k = header["kdf"]
         salt = bytes.fromhex(k["salt"])
         kek = cc.derive_kek(password.encode("utf-8"), salt, k["m_kib"], k["t"], k["p"])
@@ -149,13 +148,38 @@ class Vault:
             # alguien los editó (p.ej. para debilitar Argon2), esto falla.
             aad = cc.kdf_aad(k["m_kib"], k["t"], k["p"], salt)
             w = header["mk_wrapped"]
-            mk = cc.unwrap_master_key(
+            return cc.unwrap_master_key(
                 kek, {"nonce": bytes.fromhex(w["nonce"]), "ct": bytes.fromhex(w["ct"])}, aad
             )
         finally:
             cc.zeroize(kek)
 
+    @classmethod
+    def open(cls, root: Path, password: str) -> "Vault":
+        root = Path(root)
+        try:
+            header = json.loads((root / HEADER_NAME).read_text())
+        except (OSError, ValueError) as e:
+            raise VaultError("No es una bóveda válida (header ilegible).") from e
+        mk = cls._unlock_mk(header, password)
         v = cls(root)
+        v._mk = mk
+        v._keys = cc.derive_subkeys(mk)
+        v._load_index()
+        return v
+
+    @classmethod
+    def open_remote(cls, store, password: str) -> "Vault":
+        """Abre una bóveda alojada en un almacén remoto (p.ej. Google Drive)
+        en SOLO LECTURA: previsualizar, ver por streaming y exportar. Nada
+        se escribe en el remoto, así que no hay riesgo de corromper el
+        índice por conflictos de concurrencia."""
+        try:
+            header = json.loads(store.read_header().decode("utf-8"))
+        except (OSError, ValueError) as e:
+            raise VaultError("No se pudo leer el header remoto.") from e
+        mk = cls._unlock_mk(header, password)
+        v = cls(None, store=store, read_only=True)
         v._mk = mk
         v._keys = cc.derive_subkeys(mk)
         v._load_index()
@@ -176,6 +200,7 @@ class Vault:
 
     def change_password(self, old: str, new: str, params: dict | None = None) -> None:
         """Cambiar contraseña = re-envolver 32 bytes. No se recifra contenido."""
+        self._require_writable()
         header = json.loads((self.root / HEADER_NAME).read_text())
         k = header["kdf"]
         salt_old = bytes.fromhex(k["salt"])
@@ -217,7 +242,13 @@ class Vault:
             raise VaultError("La bóveda está bloqueada.")
         return self._keys
 
+    def _require_writable(self) -> None:
+        if self.read_only:
+            raise VaultError("Bóveda remota: solo lectura (ver y exportar).")
+
     def _save_index(self) -> None:
+        if self.read_only:
+            return   # remota: los cambios de metadata se descartan en silencio
         keys = self._require_keys()
         # Las carpetas viven SOLO aquí, dentro del índice cifrado: en disco
         # no existe ninguna estructura de directorios que las refleje.
@@ -236,7 +267,10 @@ class Vault:
 
     def _load_index(self) -> None:
         keys = self._require_keys()
-        blob = (self.root / INDEX_NAME).read_bytes()
+        if self.root is not None:
+            blob = (self.root / INDEX_NAME).read_bytes()
+        else:
+            blob = self.store.read_index()
         payload = cc.open_sealed(keys.index, blob, cc.index_aad())
         (ln,) = struct.unpack(">I", payload[:4])
         data = json.loads(payload[4 : 4 + ln])
@@ -293,6 +327,7 @@ class Vault:
         return sorted(self._folders, key=str.lower)
 
     def create_folder(self, name: str) -> None:
+        self._require_writable()
         name = name.strip()
         if not name or "/" in name or "\\" in name:
             raise VaultError("Nombre de carpeta no válido.")
@@ -305,6 +340,7 @@ class Vault:
     def delete_folder(self, name: str) -> None:
         """Quita la carpeta; su contenido pasa a 'sin carpeta'. Nunca borra
         archivos: borrar contenido es una acción separada y explícita."""
+        self._require_writable()
         with self._lock:
             if name in self._folders:
                 self._folders.remove(name)
@@ -314,6 +350,7 @@ class Vault:
             self._save_index()
 
     def move_files(self, entry_ids: list[str], folder: str) -> None:
+        self._require_writable()
         if folder and folder not in self._folders:
             raise VaultError("La carpeta destino no existe.")
         with self._lock:
@@ -328,6 +365,8 @@ class Vault:
         orientación al saltar (videos con tramos grabados de lado).
         Persisten dentro del índice cifrado: en disco jamás se ve ni
         cuántos hay, ni dónde, ni sus nombres."""
+        if self.read_only:
+            return   # remota: la metadata de sesión no persiste ni se simula
         norm: dict[int, tuple[str, int | None]] = {}
         for m in marks:
             if isinstance(m, (list, tuple)):
@@ -345,17 +384,23 @@ class Vault:
 
     def set_resume(self, entry_id: str, ms: int) -> None:
         """Última posición de reproducción, para «continuar donde ibas»."""
+        if self.read_only:
+            return
         with self._lock:
             self._entries[entry_id].resume_ms = max(0, int(ms))
             self._save_index()
 
     def set_rotation(self, entry_id: str, rotation: int) -> None:
         """Rotación persistida: un video vertical girado se queda girado."""
+        if self.read_only:
+            return
         with self._lock:
             self._entries[entry_id].rotation = int(rotation) % 360
             self._save_index()
 
     def set_favorite(self, entry_id: str, fav: bool) -> None:
+        if self.read_only:
+            return
         with self._lock:
             self._entries[entry_id].favorite = bool(fav)
             self._save_index()
@@ -364,6 +409,8 @@ class Vault:
         """Gira 90° SOLO las miniaturas. Independiente por completo de la
         rotación del contenido (`rotation`): girar la miniatura no gira el
         video/foto en el visor, ni al revés."""
+        if self.read_only:
+            return
         with self._lock:
             for eid in entry_ids:
                 e = self._entries[eid]
@@ -372,6 +419,8 @@ class Vault:
 
     def set_thumb_scale(self, entry_ids: list[str], scale: float) -> None:
         """Tamaño individual de la miniatura en la galería (1.0 = normal)."""
+        if self.read_only:
+            return
         scale = max(0.5, min(3.0, float(scale)))
         with self._lock:
             for eid in entry_ids:
@@ -384,6 +433,7 @@ class Vault:
         """Cifra e ingiere un archivo. El original NO se toca ni se borra:
         eliminarlo es decisión explícita del usuario (y ver SEGURIDAD.md
         sobre los límites del borrado en SSD)."""
+        self._require_writable()
         keys = self._require_keys()
         src = Path(src)
         size = src.stat().st_size
@@ -472,6 +522,7 @@ class Vault:
         return dst
 
     def delete_file(self, entry_id: str) -> None:
+        self._require_writable()
         with self._lock:
             e = self._entries.pop(entry_id)
             self._save_index()  # primero el índice: si falla, no perdemos blobs referenciados
