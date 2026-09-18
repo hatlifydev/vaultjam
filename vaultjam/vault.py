@@ -775,18 +775,24 @@ class ChunkReader:
     def tell(self) -> int:
         return self._pos
 
-    def prefetch_ahead(self, n: int = 8) -> None:
-        """Mantiene la ventana de pre-carga llena desde la posición actual.
-        El visor lo invoca cada segundo: así el buffer sigue creciendo
-        AUNQUE el video esté en pausa, y tras un salto la ventana sigue al
-        nuevo punto. Idempotente (la caché y el dedup lo hacen barato)."""
+    def prefetch_ahead(self, n: int = 8, start_idx: int | None = None,
+                       horizon: int = 64) -> None:
+        """Relleno PROGRESIVO del buffer: cada llamada pide el siguiente
+        lote (n) de chunks AÚN NO descargados dentro del horizonte, desde
+        `start_idx` (la posición de reproducción que pasa el visor — no la
+        del demuxer, que sondea el final del MP4 y engañaría al ancla).
+        Invocado cada tick, el buffer sigue creciendo con el video EN
+        PAUSA hasta llenar el horizonte, que avanza al reproducir."""
         pf = getattr(self._store, "prefetch", None)
-        if pf is None:
+        if pf is None or not self._entry.chunks:
             return
-        idx = self._pos // cc.CHUNK_SIZE
-        ids = self._entry.chunks[idx + 1: idx + 1 + n]
-        if ids:
-            pf(ids)
+        idx = start_idx if start_idx is not None else self._pos // cc.CHUNK_SIZE
+        idx = max(0, min(idx, self._entry.total_chunks - 1))
+        down = getattr(self._store, "downloaded", None) or set()
+        window = self._entry.chunks[idx: idx + horizon]
+        pending = [c for c in window if c not in down][:n]
+        if pending:
+            pf(pending)
 
     def buffered_ranges(self) -> list[tuple[float, float]]:
         """Tramos [0..1] del video ya descargados en esta sesión, para

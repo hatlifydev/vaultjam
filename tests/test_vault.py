@@ -367,6 +367,14 @@ def test_remote_readonly_streaming_and_guards(tmp_path, vault):
     r.seek(0)
     assert r.read(-1) == original
     assert r.buffered_ranges() == [(0.0, 1.0)]   # ahora sí: entero bajado
+    # relleno progresivo: lo ya bajado no se vuelve a pedir; los huecos sí
+    before = len(store.prefetched)
+    r.prefetch_ahead(8, start_idx=0)
+    assert len(store.prefetched) == before, "pidió chunks ya descargados"
+    hole = rv.get(ev.id).chunks[1]
+    store.downloaded.discard(hole)               # simular hueco en el buffer
+    r.prefetch_ahead(8, start_idx=0)
+    assert store.prefetched[-1] == hole, "no rellenó el hueco pendiente"
     assert rv.read_thumb(ep.id)[:2] == b"\xff\xd8"
     out = tmp_path / "out"
     out.mkdir()

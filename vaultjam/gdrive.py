@@ -148,7 +148,9 @@ class DriveStore:
     writable = False
 
     def __init__(self, service, folder_id: str, name: str = "",
-                 cache_blobs: int = 48, service_factory=None):
+                 cache_blobs: int = 96, service_factory=None):
+        # cache 96 MiB: retiene el horizonte de pre-carga del video (64)
+        # más miniaturas recientes sin re-descargar.
         self._svc = service
         self._svc_factory = service_factory   # un cliente HTTP por hilo
         self._tls = threading.local()
