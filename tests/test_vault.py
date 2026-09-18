@@ -381,12 +381,33 @@ def test_pin_curtain(tmp_path, vault):
     v2 = Vault.open(tmp_path / "v.vault", PW)
     assert v2.has_pin and v2.check_pin("5678")
 
+    # llave de escape: la contraseña maestra autoriza sin el PIN antiguo
+    assert v2.verify_password(PW) and not v2.verify_password("mala")
+    with pytest.raises(VaultError):
+        v2.set_pin(None, "1111")                    # sin PIN ni contraseña: no
+    with pytest.raises(VaultError):
+        v2.set_pin(None, "1111", password="mala")   # contraseña mala: tampoco
+    v2.set_pin(None, "1111", password=PW)           # PIN olvidado -> restablecer
+    assert v2.check_pin("1111")
+    with pytest.raises(VaultError):
+        v2.remove_pin(old="0000")                   # quitar exige autorización
+    v2.remove_pin(password=PW)                      # ...o la contraseña
+    assert not v2.has_pin
+    v2.set_pin(None, "2222")                        # sin PIN previo: directo
+    v2.remove_pin(old="2222")                       # quitar con el PIN actual
+    assert not v2.has_pin
+    v2.lock()
+    v3 = Vault.open(tmp_path / "v.vault", PW)
+    assert not v3.has_pin                           # la eliminación persiste
+    v3.set_pin(None, "5678")
+
     # bóveda remota: el PIN llega con el índice y los cambios son de sesión
     store = _FakeRemoteStore(tmp_path / "v.vault")
     rv = Vault.open_remote(store, PW)
     assert rv.has_pin and rv.check_pin("5678")
     rv.set_pin("5678", "1111")          # permitido, pero no persiste en disco
     assert rv.check_pin("1111")
+    assert rv.verify_password(PW)       # la llave de escape también en remoto
     rv2 = Vault.open_remote(store, PW)
     assert rv2.check_pin("5678")        # el remoto sigue con el original
 

@@ -81,10 +81,12 @@ viven dentro de un índice cifrado; en disco solo se ven blobs idénticos de
   a Drive en curso, y se rearma al terminar.
 - Cortina 🙈 con PIN de 4 dígitos: oculta miniaturas y nombres e impide
   abrir o exportar, SIN bloquear la bóveda (ideal mientras corre una
-  sincronización). «👁 Mostrar» pide el PIN; el botón «PIN…» lo crea o lo
-  cambia (pidiendo el actual). El PIN se guarda hasheado dentro del índice
-  cifrado — es una cortina contra miradas, no criptografía: quien tenga la
-  contraseña de la bóveda no lo necesita.
+  sincronización). «👁 Mostrar» pide el PIN; el botón «PIN…» lo crea, lo
+  cambia (pidiendo el actual), lo quita, o lo restablece si lo olvidaste
+  usando la contraseña maestra de la bóveda (la llave de escape: quien la
+  tiene ya es el dueño — también sirve para mostrar si fallas el PIN). El
+  PIN se guarda hasheado dentro del índice cifrado — es una cortina contra
+  miradas, no criptografía.
 
 ## Ejecutar en desarrollo
 

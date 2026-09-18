@@ -525,10 +525,37 @@ class Vault:
         salt_hex, h = self._pin.split(":", 1)
         return hashlib.sha256(bytes.fromhex(salt_hex) + pin.encode()).hexdigest() == h
 
-    def set_pin(self, old: str | None, new: str) -> None:
-        """Crea o cambia el PIN; cambiar exige el PIN anterior."""
-        if self._pin is not None and not self.check_pin(old or ""):
-            raise VaultError("El PIN actual no es correcto.")
+    def verify_password(self, password: str) -> bool:
+        """Comprueba la contraseña maestra sin abrir nada (deriva la KEK y
+        desenvuelve la MK; tarda ~1 s por Argon2id, a propósito). Es la
+        llave de escape del PIN: quien la tiene ya es el dueño."""
+        try:
+            if self.root is not None:
+                header = json.loads((self.root / HEADER_NAME).read_text())
+            else:
+                header = json.loads(self.store.read_header().decode("utf-8"))
+            mk = self._unlock_mk(header, password)
+            cc.zeroize(mk)
+            return True
+        except (VaultError, cc.VaultCryptoError, OSError, ValueError):
+            return False
+
+    def _pin_gate(self, old: str | None, password: str | None) -> None:
+        """Autoriza tocar un PIN existente: PIN antiguo correcto O
+        contraseña maestra correcta (PIN olvidado)."""
+        if self._pin is None:
+            return
+        if old is not None and self.check_pin(old):
+            return
+        if password is not None and self.verify_password(password):
+            return
+        raise VaultError("El PIN actual (o la contraseña de la bóveda) no es correcto.")
+
+    def set_pin(self, old: str | None, new: str,
+                password: str | None = None) -> None:
+        """Crea o cambia el PIN. Cambiar exige el PIN anterior, o la
+        contraseña maestra si se olvidó."""
+        self._pin_gate(old, password)
         if not (new.isdigit() and len(new) == 4):
             raise VaultError("El PIN debe ser exactamente 4 dígitos.")
         salt = cc.random_bytes(16)
@@ -536,6 +563,14 @@ class Vault:
         with self._lock:
             self._pin = f"{salt.hex()}:{digest}"
             self._save_index()   # remota: no-op -> PIN solo de esta sesión
+
+    def remove_pin(self, old: str | None = None,
+                   password: str | None = None) -> None:
+        """Elimina el PIN, autorizado por el PIN actual o la contraseña."""
+        self._pin_gate(old, password)
+        with self._lock:
+            self._pin = None
+            self._save_index()
 
     def all_blob_ids(self) -> list[str]:
         """Todos los blobs que referencia el índice (chunks + miniaturas),

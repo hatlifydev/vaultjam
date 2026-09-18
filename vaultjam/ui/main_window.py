@@ -587,8 +587,15 @@ class MainWindow(QMainWindow):
             if pin is None:
                 return
             if not self._vault.check_pin(pin):
-                QMessageBox.warning(self, "Mostrar contenido", "PIN incorrecto.")
-                return
+                # Llave de escape: la contraseña maestra también muestra.
+                if QMessageBox.question(
+                    self, "Mostrar contenido",
+                    "PIN incorrecto. ¿Mostrar usando la contraseña de la bóveda?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                ) != QMessageBox.StandardButton.Yes:
+                    return
+                if self._ask_vault_password() is None:
+                    return
             self._privacy = False
             self._gallery.set_privacy(False)
             self._gallery.refresh_meta(self._vault)   # restaura nombres/estrellas
@@ -596,25 +603,96 @@ class MainWindow(QMainWindow):
             self._act_privacy.setText("🙈 Ocultar")
             self._update_status()
 
+    def _ask_vault_password(self) -> str | None:
+        """Pide y verifica la contraseña maestra (llave de escape del PIN).
+        La verificación tarda ~1 s (Argon2id) con cursor de espera."""
+        from PySide6.QtWidgets import QApplication
+        txt, ok = QInputDialog.getText(
+            self, "Contraseña de la bóveda",
+            "Contraseña maestra (para restablecer el PIN):",
+            QLineEdit.EchoMode.Password)
+        if not ok or not txt:
+            return None
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            valid = self._vault.verify_password(txt)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not valid:
+            QMessageBox.warning(self, "Contraseña", "Contraseña incorrecta.")
+            return None
+        return txt
+
+    def _ask_new_pin(self, title: str) -> str | None:
+        p1 = self._ask_pin(title, "Nuevo PIN (4 dígitos):")
+        if p1 is None:
+            return None
+        p2 = self._ask_pin(title, "Repite el nuevo PIN:")
+        if p2 != p1:
+            QMessageBox.warning(self, title, "Los PIN no coinciden.")
+            return None
+        return p1
+
+    def _pin_note(self) -> str:
+        return " (solo esta sesión: bóveda remota)" if self._vault.read_only else ""
+
     def _change_pin(self):
-        old = None
-        if self._vault.has_pin:
+        if not self._vault.has_pin:
+            p = self._ask_new_pin("Crear PIN")
+            if p is not None:
+                self._vault.set_pin(None, p)
+                QMessageBox.information(self, "PIN", f"PIN creado{self._pin_note()}.")
+            return
+
+        box = QMessageBox(self)
+        box.setWindowTitle("PIN")
+        box.setText("¿Qué quieres hacer con el PIN de la cortina?")
+        b_change = box.addButton("Cambiar PIN", QMessageBox.ButtonRole.AcceptRole)
+        b_remove = box.addButton("Quitar PIN", QMessageBox.ButtonRole.DestructiveRole)
+        b_forgot = box.addButton("Olvidé el PIN…", QMessageBox.ButtonRole.HelpRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+
+        if clicked is b_change:
             old = self._ask_pin("Cambiar PIN", "PIN actual:")
             if old is None:
                 return
             if not self._vault.check_pin(old):
                 QMessageBox.warning(self, "Cambiar PIN", "El PIN actual no es correcto.")
                 return
-        p1 = self._ask_pin("Cambiar PIN", "Nuevo PIN (4 dígitos):")
-        if p1 is None:
-            return
-        p2 = self._ask_pin("Cambiar PIN", "Repite el nuevo PIN:")
-        if p2 != p1:
-            QMessageBox.warning(self, "Cambiar PIN", "Los PIN no coinciden.")
-            return
-        self._vault.set_pin(old, p1)
-        note = (" (solo esta sesión: bóveda remota)" if self._vault.read_only else "")
-        QMessageBox.information(self, "PIN", f"PIN actualizado{note}.")
+            p = self._ask_new_pin("Cambiar PIN")
+            if p is not None:
+                self._vault.set_pin(old, p)
+                QMessageBox.information(self, "PIN", f"PIN actualizado{self._pin_note()}.")
+        elif clicked is b_remove:
+            old = self._ask_pin("Quitar PIN", "PIN actual:")
+            if old is None:
+                return
+            if not self._vault.check_pin(old):
+                QMessageBox.warning(self, "Quitar PIN", "El PIN actual no es correcto.")
+                return
+            self._vault.remove_pin(old=old)
+            QMessageBox.information(self, "PIN", f"PIN eliminado{self._pin_note()}.")
+        elif clicked is b_forgot:
+            # La contraseña maestra autoriza: quien la tiene ya es el dueño.
+            pw = self._ask_vault_password()
+            if pw is None:
+                return
+            ret = QMessageBox.question(
+                self, "Restablecer PIN",
+                "Contraseña correcta. ¿Definir un PIN nuevo?\n"
+                "(«No» elimina el PIN.)",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel)
+            if ret == QMessageBox.StandardButton.Yes:
+                p = self._ask_new_pin("Restablecer PIN")
+                if p is not None:
+                    self._vault.set_pin(None, p, password=pw)
+                    QMessageBox.information(self, "PIN", f"PIN restablecido{self._pin_note()}.")
+            elif ret == QMessageBox.StandardButton.No:
+                self._vault.remove_pin(password=pw)
+                QMessageBox.information(self, "PIN", f"PIN eliminado{self._pin_note()}.")
 
     def _open_entry(self, entry_id: str):
         if self._privacy:
