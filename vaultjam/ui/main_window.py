@@ -12,9 +12,10 @@ from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QInputDialog, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressDialog,
-    QSlider, QSplitter, QToolBar, QWidget,
+    QComboBox, QFileDialog, QFrame, QInputDialog, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+    QProgressBar, QProgressDialog, QPushButton, QSlider, QSplitter,
+    QToolBar, QVBoxLayout, QWidget,
 )
 
 from ..thumbs import PHOTO_EXTS, VIDEO_EXTS, classify, make_thumbnail
@@ -165,8 +166,37 @@ class MainWindow(QMainWindow):
         self._gallery.openRequested.connect(self._open_entry)
         self._gallery.favoritesChanged.connect(self._light_refresh)
 
+        # Panel de sincronización: vive ENCIMA de las carpetas, en la
+        # columna lateral. Nada de diálogos modales: la bóveda sigue
+        # plenamente usable (navegar, ver, cortina 🙈) durante horas de
+        # subida; solo Importar/Eliminar se pausan mientras tanto.
+        self._sync_panel = QFrame()
+        self._sync_panel.setFrameShape(QFrame.Shape.StyledPanel)
+        sp = QVBoxLayout(self._sync_panel)
+        sp.setContentsMargins(8, 6, 8, 6)
+        sp.setSpacing(4)
+        sync_title = QLabel("☁ Sincronizando a Drive")
+        sync_title.setStyleSheet("font-weight: bold;")
+        self._sync_label = QLabel("Preparando…")
+        self._sync_label.setWordWrap(True)
+        self._sync_bar = QProgressBar()
+        self._sync_bar.setRange(0, 0)
+        self._sync_cancel_btn = QPushButton("Cancelar subida")
+        self._sync_cancel_btn.clicked.connect(self._cancel_sync)
+        for wdg in (sync_title, self._sync_label, self._sync_bar,
+                    self._sync_cancel_btn):
+            sp.addWidget(wdg)
+        self._sync_panel.hide()
+
+        side = QWidget()
+        sv = QVBoxLayout(side)
+        sv.setContentsMargins(0, 0, 0, 0)
+        sv.setSpacing(4)
+        sv.addWidget(self._sync_panel)
+        sv.addWidget(self._sidebar, 1)
+
         split = QSplitter(Qt.Orientation.Horizontal)
-        split.addWidget(self._sidebar)
+        split.addWidget(side)
         split.addWidget(self._gallery)
         split.setStretchFactor(1, 1)
         split.setSizes([190, 900])
@@ -259,12 +289,33 @@ class MainWindow(QMainWindow):
                 "Reanudable y verificado; requiere autorizar escritura.")
         self._sync_worker: _SyncWorker | None = None
 
+        self._update_action_states()
         self._reload_sidebar(select=None)
         self._update_status()
         if vault.read_only:
             self._check_availability(refresh=False)   # chequeo inicial
 
     # ---------------- sincronizar a Drive (bóveda local) ----------------
+
+    def _update_action_states(self):
+        """Único punto que decide qué acciones están activas, combinando
+        los tres estados: bóveda remota, cortina 🙈 y sincronización."""
+        ro = self._vault.read_only
+        syncing = getattr(self, "_sync_worker", None) is not None
+        priv = getattr(self, "_privacy", False)
+        self._act_import.setEnabled(not ro and not syncing)
+        self._act_delete.setEnabled(not ro and not syncing and not priv)
+        self._act_export.setEnabled(not priv)
+        self._act_newfolder.setEnabled(not ro)
+        self._act_move.setEnabled(not ro and not priv)
+        if hasattr(self, "_act_sync"):
+            self._act_sync.setEnabled(not syncing)
+
+    def _cancel_sync(self):
+        if self._sync_worker is not None:
+            self._sync_worker.cancel()
+            self._sync_cancel_btn.setEnabled(False)
+            self._sync_label.setText("Cancelando… (termina el blob en curso)")
 
     def _sync_drive(self):
         if self._sync_worker is not None:
@@ -294,38 +345,37 @@ class MainWindow(QMainWindow):
 
         key = f"syncfolder/{self._vault.root}"
         hint = str(settings.value(key, "")) or None
-        prog = QProgressDialog("Conectando con Google…", "Cancelar", 0, 0, self)
-        prog.setWindowModality(Qt.WindowModality.WindowModal)
-        prog.setMinimumDuration(0)
-        prog.setAutoClose(False)
-        prog.setAutoReset(False)
 
         self._sync_worker = w = _SyncWorker(
             secret, self._vault.root, self._vault.all_blob_ids(),
             self._vault.root.name, hint, self)
         self._autolock.stop()   # sin auto-bloqueo mientras se sincroniza
-        w.status.connect(prog.setLabelText)
+        self._update_action_states()
+        # Panel lateral en marcha (no modal: la bóveda sigue usable)
+        self._sync_bar.setRange(0, 0)
+        self._sync_label.setText("Autorizando con Google…")
+        self._sync_cancel_btn.setEnabled(True)
+        self._sync_panel.show()
+        w.status.connect(self._sync_label.setText)
 
         def on_progress(done: int, total: int):
-            prog.setRange(0, max(total, 1))
-            prog.setValue(done)
+            self._sync_bar.setRange(0, max(total, 1))
+            self._sync_bar.setValue(done)
 
         w.progress.connect(on_progress)
-        prog.canceled.connect(w.cancel)
 
         def done(result):
             self._sync_worker = None
+            self._sync_panel.hide()
             self._reset_autolock()   # rearmar la cuenta atrás al terminar
-            prog.close()
+            self._update_action_states()
             if isinstance(result, dict):
                 settings.setValue(key, result["folder_id"])
                 if result.get("cancelado"):
-                    QMessageBox.information(
-                        self, "Sincronizar a Drive",
-                        f"Cancelado sin peligro: {result['subidos']} blobs subidos "
-                        f"quedan aprovechados; faltan {result['pendientes']}. El "
-                        "índice remoto no se tocó. Vuelve a sincronizar cuando "
-                        "quieras para continuar.")
+                    self.statusBar().showMessage(
+                        f"Sincronización cancelada sin peligro: {result['subidos']} "
+                        f"blobs subidos quedan aprovechados; faltan "
+                        f"{result['pendientes']}. Pulsa ☁ para continuar.")
                 else:
                     extra = (f"\nBlobs huérfanos en el espejo: {result['huerfanos']} "
                              "(de elementos borrados localmente; son ciphertext "
@@ -529,8 +579,7 @@ class MainWindow(QMainWindow):
                 v.close()
             self._viewers.clear()
             self._gallery.set_privacy(True)
-            self._act_export.setEnabled(False)
-            self._act_delete.setEnabled(False)
+            self._update_action_states()
             self._act_privacy.setText("👁 Mostrar")
             self.statusBar().showMessage("Contenido oculto 🙈 — 👁 Mostrar pide el PIN")
         else:
@@ -543,8 +592,7 @@ class MainWindow(QMainWindow):
             self._privacy = False
             self._gallery.set_privacy(False)
             self._gallery.refresh_meta(self._vault)   # restaura nombres/estrellas
-            self._act_export.setEnabled(True)
-            self._act_delete.setEnabled(not self._vault.read_only)
+            self._update_action_states()
             self._act_privacy.setText("🙈 Ocultar")
             self._update_status()
 
