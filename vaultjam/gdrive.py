@@ -26,42 +26,52 @@ import threading
 from collections import OrderedDict
 from pathlib import Path
 
-SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+SCOPES_RO = ["https://www.googleapis.com/auth/drive.readonly"]
+SCOPES_RW = ["https://www.googleapis.com/auth/drive"]   # solo para sincronizar
+SCOPES = SCOPES_RO   # alias de compatibilidad
 APPDIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "VaultJam"
-TOKEN_PATH = APPDIR / "token.json"
+TOKEN_PATH = APPDIR / "token.json"        # token de SOLO LECTURA (abrir remotas)
+TOKEN_RW_PATH = APPDIR / "token_rw.json"  # token de escritura (solo sincronizar)
 
 
-def get_service(client_secret_path: str):
+def get_service(client_secret_path: str, readonly: bool = True):
     """Autentica (abre el navegador la primera vez) y devuelve el cliente
-    de la API de Drive. El refresh token queda en %APPDATA%\\VaultJam."""
+    de la API de Drive. Tokens SEPARADOS por nivel de permiso: abrir
+    bóvedas remotas usa solo-lectura; sincronizar pide escritura aparte,
+    así el token de uso diario nunca puede modificar tu Drive."""
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
 
+    scopes = SCOPES_RO if readonly else SCOPES_RW
+    token_path = TOKEN_PATH if readonly else TOKEN_RW_PATH
     creds = None
-    if TOKEN_PATH.exists():
+    if token_path.exists():
         try:
-            creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+            creds = Credentials.from_authorized_user_file(str(token_path), scopes)
         except Exception:
             creds = None
+    if creds is not None and not creds.has_scopes(scopes):
+        creds = None   # el token guardado no cubre el permiso pedido
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
         except Exception:
             creds = None
     if not creds or not creds.valid:
-        flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, SCOPES)
+        flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, scopes)
         # Abre el navegador del usuario; el "servidor" es un puerto efímero
         # en localhost solo para recibir el código OAuth.
         creds = flow.run_local_server(port=0)
         APPDIR.mkdir(parents=True, exist_ok=True)
-        TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
+        token_path.write_text(creds.to_json(), encoding="utf-8")
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
 def forget_token() -> None:
     TOKEN_PATH.unlink(missing_ok=True)
+    TOKEN_RW_PATH.unlink(missing_ok=True)
 
 
 def find_vaults(service) -> list[tuple[str, str]]:

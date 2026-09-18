@@ -134,6 +134,23 @@ que una app acceda a TU Drive; no hay servidor de terceros involucrado):
 autorizar; el permiso es **solo de lectura** de Drive) → elige la bóveda,
 contraseña y «Abrir remota».
 
+### Sincronizar tu bóveda local a Drive (☁, recomendado frente a subir por web)
+
+Con una bóveda **local** abierta, el botón **«☁ Sincronizar a Drive»** crea
+o completa el espejo cifrado por la API: compara el inventario y sube SOLO
+los blobs que falten, repara los que quedaron a medias (tamaño incorrecto),
+sube el índice **al final** (así un lector remoto nunca ve un índice
+apuntando a blobs inexistentes) y verifica el resultado. Es **reanudable**:
+cancela cuando quieras y la próxima ejecución continúa donde quedó. Los
+elementos borrados localmente dejan blobs huérfanos en el espejo (ciphertext
+inofensivo); el resumen final los cuenta.
+
+La escritura usa un **token aparte** (`token_rw.json`, scope `drive`
+completo — Google no ofrece "escribir solo en una carpeta" para carpetas
+creadas fuera de la app): se pide la primera vez que sincronizas y el token
+de solo lectura del visor remoto queda intacto. Flujo recomendado: editas
+en local → ☁ sincronizas → ves desde cualquier parte en remoto.
+
 Notas honestas: el token OAuth queda en `%APPDATA%\VaultJam\token.json` —
 da lectura de tu Drive a quien lo robe (no de la bóveda, que sigue
 cifrada); el botón «Olvidar acceso» lo borra y puedes revocarlo en

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QInputDialog, QLabel, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressDialog,
@@ -63,6 +63,45 @@ class _ImportWorker(QThread):
             except Exception as e:  # noqa: BLE001
                 errors.append((path.name, str(e)))
         self.finished_ok.emit(ok, errors)
+
+
+class _SyncWorker(QThread):
+    """Espejo local → Drive en segundo plano. Solo mueve ciphertext: toma
+    la lista de blobs y las rutas ANTES de arrancar, así ni siquiera
+    necesita la bóveda desbloqueada mientras sube."""
+
+    progress = Signal(int, int)
+    status = Signal(str)
+    finished_ok = Signal(object)   # dict resumen | Exception
+
+    def __init__(self, secret: str, root, blob_ids: list[str],
+                 folder_name: str, folder_hint: str | None, parent=None):
+        super().__init__(parent)
+        self._secret = secret
+        self._root = root
+        self._blob_ids = blob_ids
+        self._folder_name = folder_name
+        self._hint = folder_hint
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def run(self):
+        try:
+            from ..gdrive import get_service
+            from ..gsync import DriveOps, DriveSyncer
+            self.status.emit("Autorizando con Google (permiso de escritura)…")
+            svc = get_service(self._secret, readonly=False)
+            syncer = DriveSyncer(DriveOps(svc), self._root, self._blob_ids,
+                                 folder_name=self._folder_name,
+                                 folder_hint=self._hint)
+            self.finished_ok.emit(syncer.sync(
+                progress=lambda d, t: self.progress.emit(d, t),
+                status=lambda m: self.status.emit(m),
+                cancelled=lambda: self._cancel))
+        except Exception as e:  # noqa: BLE001
+            self.finished_ok.emit(e)
 
 
 class _AvailWorker(QThread):
@@ -202,11 +241,98 @@ class MainWindow(QMainWindow):
             self._act_check.setToolTip(
                 "Comprobar qué elementos ya tienen todos sus chunks en Drive "
                 "(marco verde = completo, rojo = subida incompleta)")
+        else:
+            self._act_sync = tb.addAction("☁ Sincronizar a Drive", self._sync_drive)
+            self._act_sync.setToolTip(
+                "Sube a tu Google Drive los blobs cifrados que falten y "
+                "actualiza el índice (espejo de respaldo/visualización). "
+                "Reanudable y verificado; requiere autorizar escritura.")
+        self._sync_worker: _SyncWorker | None = None
 
         self._reload_sidebar(select=None)
         self._update_status()
         if vault.read_only:
             self._check_availability(refresh=False)   # chequeo inicial
+
+    # ---------------- sincronizar a Drive (bóveda local) ----------------
+
+    def _sync_drive(self):
+        if self._sync_worker is not None:
+            return
+        settings = QSettings("VaultJam", "VaultJam")
+        secret = str(settings.value("gdrive_secret", ""))
+        if not secret or not Path(secret).exists():
+            QMessageBox.information(
+                self, "Sincronizar a Drive",
+                "Primero configura tu client_secret.json en la pestaña "
+                "«Google Drive» de la pantalla de desbloqueo (ver README).")
+            return
+        if QMessageBox.question(
+            self, "Sincronizar a Drive",
+            "Se subirán a tu Google Drive los blobs cifrados que falten y se "
+            "actualizará el índice del espejo.\n\n"
+            "• Google solo recibe ciphertext, como siempre.\n"
+            "• Requiere autorizar permiso de ESCRITURA en Drive (token "
+            "aparte del de solo lectura; la primera vez se abre el navegador).\n"
+            "• Si tienes una subida por la web en curso sobre esa carpeta, "
+            "cancélala para evitar duplicados.\n"
+            "• Es reanudable: puedes cancelar y continuar más tarde.\n\n"
+            "¿Continuar?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        key = f"syncfolder/{self._vault.root}"
+        hint = str(settings.value(key, "")) or None
+        prog = QProgressDialog("Conectando con Google…", "Cancelar", 0, 0, self)
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setAutoClose(False)
+        prog.setAutoReset(False)
+
+        self._sync_worker = w = _SyncWorker(
+            secret, self._vault.root, self._vault.all_blob_ids(),
+            self._vault.root.name, hint, self)
+        w.status.connect(prog.setLabelText)
+
+        def on_progress(done: int, total: int):
+            prog.setRange(0, max(total, 1))
+            prog.setValue(done)
+            self._reset_autolock()   # una subida larga cuenta como actividad
+
+        w.progress.connect(on_progress)
+        prog.canceled.connect(w.cancel)
+
+        def done(result):
+            self._sync_worker = None
+            prog.close()
+            if isinstance(result, dict):
+                settings.setValue(key, result["folder_id"])
+                if result.get("cancelado"):
+                    QMessageBox.information(
+                        self, "Sincronizar a Drive",
+                        f"Cancelado sin peligro: {result['subidos']} blobs subidos "
+                        f"quedan aprovechados; faltan {result['pendientes']}. El "
+                        "índice remoto no se tocó. Vuelve a sincronizar cuando "
+                        "quieras para continuar.")
+                else:
+                    extra = (f"\nBlobs huérfanos en el espejo: {result['huerfanos']} "
+                             "(de elementos borrados localmente; son ciphertext "
+                             "inofensivo)") if result.get("huerfanos") else ""
+                    QMessageBox.information(
+                        self, "Sincronizar a Drive",
+                        "Espejo completo y verificado ✔\n\n"
+                        f"Subidos ahora: {result['subidos']} "
+                        f"(corregidos: {result['corregidos']})\n"
+                        f"Ya estaban: {result['ya_presentes']}\n"
+                        f"Total en el espejo: {result['total']} blobs{extra}")
+            else:
+                QMessageBox.critical(self, "Sincronizar a Drive",
+                                     f"La sincronización falló:\n{result}\n\n"
+                                     "Reintenta: continuará donde quedó.")
+
+        w.finished_ok.connect(done)
+        w.start()
 
     # ---------------- disponibilidad remota ----------------
 
@@ -452,6 +578,10 @@ class MainWindow(QMainWindow):
         if self._import_worker is not None:
             self._import_worker.cancel()
             self._import_worker.wait(10000)
+        if self._sync_worker is not None:
+            self._sync_worker.cancel()      # corta en el próximo blob; seguro
+            self._sync_worker.wait(30000)
+            self._sync_worker = None
         for v in list(self._viewers):
             v.close()
         self._viewers.clear()
@@ -472,6 +602,10 @@ class MainWindow(QMainWindow):
             if self._import_worker is not None:
                 self._import_worker.cancel()
                 self._import_worker.wait(10000)
+            if self._sync_worker is not None:
+                self._sync_worker.cancel()
+                self._sync_worker.wait(30000)
+                self._sync_worker = None
             for v in list(self._viewers):
                 v.close()
             self._gallery.clear_secure()

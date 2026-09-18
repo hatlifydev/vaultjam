@@ -502,6 +502,17 @@ class Vault:
     def open_reader(self, entry_id: str) -> "ChunkReader":
         return ChunkReader(self, self._entries[entry_id])
 
+    def all_blob_ids(self) -> list[str]:
+        """Todos los blobs que referencia el índice (chunks + miniaturas),
+        sin duplicados. Es el inventario que debe existir en un espejo."""
+        out: dict[str, None] = {}
+        for e in self._entries.values():
+            for c in e.chunks:
+                out[c] = None
+            if e.thumb:
+                out[e.thumb] = None
+        return list(out)
+
     def availability(self, refresh: bool = False) -> dict[str, bool] | None:
         """Solo almacenes remotos: qué elementos tienen TODOS sus chunks ya
         disponibles (p.ej. con una subida a Drive aún en curso). None si el
