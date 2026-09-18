@@ -21,8 +21,8 @@ from .ui.unlock import UnlockDialog
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setApplicationName("Boveda")
-    app.setOrganizationName("Boveda")
+    app.setApplicationName("VaultJam")
+    app.setOrganizationName("VaultJam")
 
     while True:
         dlg = UnlockDialog()

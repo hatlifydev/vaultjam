@@ -41,11 +41,11 @@ def _load_recents() -> list[str]:
     """Rutas de bóvedas abiertas recientemente.
 
     ADVERTENCIA DE PRIVACIDAD (documentada en SEGURIDAD.md): las RUTAS se
-    guardan en claro en el registro de Windows (HKCU\\Software\\Boveda).
+    guardan en claro en el registro de Windows (HKCU\\Software\\VaultJam).
     No exponen contenido alguno, pero sí que existen bóvedas y dónde. El
     botón «Olvidar» las borra. Se filtran las que ya no existen.
     """
-    s = QSettings("Boveda", "Boveda")
+    s = QSettings("VaultJam", "VaultJam")
     paths = s.value("recientes", []) or []
     if isinstance(paths, str):
         paths = [paths]
@@ -55,12 +55,12 @@ def _load_recents() -> list[str]:
 def _remember_enabled() -> bool:
     """Preferencia (persistente) de recordar o no las rutas recientes.
     Activada por defecto; el usuario puede apagarla desde la casilla."""
-    v = QSettings("Boveda", "Boveda").value("recordar_recientes", True)
+    v = QSettings("VaultJam", "VaultJam").value("recordar_recientes", True)
     return v in (True, "true", "True", 1, "1")
 
 
 def _set_remember(on: bool) -> None:
-    QSettings("Boveda", "Boveda").setValue("recordar_recientes", bool(on))
+    QSettings("VaultJam", "VaultJam").setValue("recordar_recientes", bool(on))
     if not on:
         # Apagar el recuerdo también borra lo ya guardado: una preferencia
         # de privacidad que deja rastros previos no sirve de nada.
@@ -72,11 +72,11 @@ def _push_recent(path: str) -> None:
         return
     paths = [p for p in _load_recents() if p != path]
     paths.insert(0, path)
-    QSettings("Boveda", "Boveda").setValue("recientes", paths[:MAX_RECENTS])
+    QSettings("VaultJam", "VaultJam").setValue("recientes", paths[:MAX_RECENTS])
 
 
 def _clear_recents() -> None:
-    QSettings("Boveda", "Boveda").remove("recientes")
+    QSettings("VaultJam", "VaultJam").remove("recientes")
 
 
 class _KdfWorker(QThread):
@@ -99,7 +99,7 @@ class _KdfWorker(QThread):
 class UnlockDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Bóveda — desbloquear")
+        self.setWindowTitle("VaultJam — desbloquear")
         self.setMinimumWidth(520)
         self.vault: Vault | None = None
         self._worker: _KdfWorker | None = None
@@ -275,7 +275,7 @@ class UnlockDialog(QDialog):
         path = Path(self._open_path.text().strip())
         pw = self._open_pw.text()
         if not path.is_dir() or not (path / "header.json").exists():
-            QMessageBox.warning(self, "Bóveda", "Esa carpeta no contiene una bóveda válida.")
+            QMessageBox.warning(self, "VaultJam", "Esa carpeta no contiene una bóveda válida.")
             return
         if not pw:
             return
@@ -290,21 +290,21 @@ class UnlockDialog(QDialog):
         name = self._create_name.text().strip()
         pw, pw2 = self._create_pw.text(), self._create_pw2.text()
         if not name:
-            QMessageBox.warning(self, "Bóveda", "Ponle un nombre a la bóveda.")
+            QMessageBox.warning(self, "VaultJam", "Ponle un nombre a la bóveda.")
             return
         if len(pw) < MIN_PASSWORD_LEN:
             QMessageBox.warning(
-                self, "Bóveda",
+                self, "VaultJam",
                 f"La contraseña debe tener al menos {MIN_PASSWORD_LEN} caracteres "
                 "(y cuanto más larga, mejor: es tu única defensa real).",
             )
             return
         if pw != pw2:
-            QMessageBox.warning(self, "Bóveda", "Las contraseñas no coinciden.")
+            QMessageBox.warning(self, "VaultJam", "Las contraseñas no coinciden.")
             return
         target = parent / f"{name}.vault"
         if target.exists():
-            QMessageBox.warning(self, "Bóveda", "Ya existe una carpeta con ese nombre.")
+            QMessageBox.warning(self, "VaultJam", "Ya existe una carpeta con ese nombre.")
             return
         self._last_tab = "create"
         self._busy(True, "Creando bóveda y derivando clave (Argon2id, 256 MiB)…")
@@ -324,9 +324,9 @@ class UnlockDialog(QDialog):
             self.accept()
             return
         if isinstance(result, VaultCryptoError):
-            QMessageBox.critical(self, "Bóveda", str(result))
+            QMessageBox.critical(self, "VaultJam", str(result))
         elif isinstance(result, (VaultError, Exception)):
-            QMessageBox.critical(self, "Bóveda", f"No se pudo abrir/crear la bóveda:\n{result}")
+            QMessageBox.critical(self, "VaultJam", f"No se pudo abrir/crear la bóveda:\n{result}")
         # Tras el error, el campo de contraseña vuelve a quedar enfocado y
         # listo para reintentar sin tocar el ratón.
         target = self._open_pw if self._last_tab == "open" else self._create_pw

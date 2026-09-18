@@ -6,7 +6,7 @@ la app usa 256 MiB. La corrección del ensamblaje no depende del coste.
 
 import pytest
 
-from boveda import crypto_core as cc
+from vaultjam import crypto_core as cc
 
 FAST = {"m_kib": 8192, "t": 1, "p": 1}
 SALT = b"\x01" * cc.SALT_LEN

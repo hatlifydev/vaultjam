@@ -1,4 +1,4 @@
-# Bóveda — fotos y videos cifrados
+# VaultJam — fotos y videos cifrados
 
 Aplicación de escritorio (Windows) que guarda fotos y videos en un
 contenedor cifrado con **AES-256-GCM** y contraseña derivada con
@@ -97,10 +97,10 @@ manipulación activa):
 
 ```powershell
 .\.venv\Scripts\python -m pip install pyinstaller
-.\.venv\Scripts\pyinstaller.exe boveda.spec --noconfirm
+.\.venv\Scripts\pyinstaller.exe vaultjam.spec --noconfirm
 ```
 
-El resultado queda en `dist\Boveda\Boveda.exe` (modo carpeta; copia la
+El resultado queda en `dist\VaultJam\VaultJam.exe` (modo carpeta; copia la
 carpeta entera). El spec ya recoge los plugins multimedia de Qt y las DLL de
 ffmpeg de PyAV.
 
@@ -124,7 +124,7 @@ re-envuelve 32 bytes.
 ## Ajustar Argon2id
 
 Los parámetros viven en `header.json` de cada bóveda y por defecto son
-`m=256 MiB, t=3, p=4` (`boveda/crypto_core.py`, `ARGON2_DEFAULTS`):
+`m=256 MiB, t=3, p=4` (`vaultjam/crypto_core.py`, `ARGON2_DEFAULTS`):
 
 - **Sube `m_kib` primero**: la memoria es lo que más encarece un ataque con
   GPU. 256 MiB es el mínimo de esta app; 512 MiB–1 GiB si tu equipo va
@@ -140,10 +140,10 @@ las existentes guardan sus propios parámetros y siguen abriendo.
 
 | Módulo | Responsabilidad |
 |---|---|
-| `boveda/crypto_core.py` | KDF, envoltura de clave, HKDF, sellado/apertura AEAD. Único sitio con criptografía. |
-| `boveda/vault.py` | Contenedor: header, índice cifrado, importar/exportar/borrar, lector por chunks. |
-| `boveda/storage.py` | Blobs uniformes, escritura atómica, timestamps normalizados. |
-| `boveda/thumbs.py` | Miniaturas en RAM (Pillow / PyAV). |
-| `boveda/memio.py` | `QIODevice` que descifra bajo demanda para el reproductor. |
-| `boveda/winsec.py` | Anti-captura de pantalla (`SetWindowDisplayAffinity`), best-effort. |
-| `boveda/ui/` | PySide6: desbloqueo, galería, visor (con `canvas.py`: rotación/zoom/brillo/contraste), ventana principal. |
+| `vaultjam/crypto_core.py` | KDF, envoltura de clave, HKDF, sellado/apertura AEAD. Único sitio con criptografía. |
+| `vaultjam/vault.py` | Contenedor: header, índice cifrado, importar/exportar/borrar, lector por chunks. |
+| `vaultjam/storage.py` | Blobs uniformes, escritura atómica, timestamps normalizados. |
+| `vaultjam/thumbs.py` | Miniaturas en RAM (Pillow / PyAV). |
+| `vaultjam/memio.py` | `QIODevice` que descifra bajo demanda para el reproductor. |
+| `vaultjam/winsec.py` | Anti-captura de pantalla (`SetWindowDisplayAffinity`), best-effort. |
+| `vaultjam/ui/` | PySide6: desbloqueo, galería, visor (con `canvas.py`: rotación/zoom/brillo/contraste), ventana principal. |

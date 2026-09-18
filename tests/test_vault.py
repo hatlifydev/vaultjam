@@ -9,10 +9,10 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from boveda import crypto_core as cc
-from boveda.storage import FIXED_TS
-from boveda.thumbs import make_thumbnail
-from boveda.vault import Vault, VaultError
+from vaultjam import crypto_core as cc
+from vaultjam.storage import FIXED_TS
+from vaultjam.thumbs import make_thumbnail
+from vaultjam.vault import Vault, VaultError
 
 FAST = {"m_kib": 8192, "t": 1, "p": 1}
 PW = "contraseña-de-prueba"

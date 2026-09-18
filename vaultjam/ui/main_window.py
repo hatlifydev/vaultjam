@@ -92,7 +92,7 @@ class MainWindow(QMainWindow):
         self._import_worker: _ImportWorker | None = None
         self._closing_to_lock = False
 
-        self.setWindowTitle("Bóveda")
+        self.setWindowTitle("VaultJam")
         self.resize(1100, 750)
 
         # Barra lateral de carpetas. Las carpetas son metadata del índice

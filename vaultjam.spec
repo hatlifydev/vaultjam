@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-# Empaquetado: .\.venv\Scripts\pyinstaller.exe boveda.spec
+# Empaquetado: .\.venv\Scripts\pyinstaller.exe vaultjam.spec
 #
 # Notas de seguridad del empaquetado:
 #  - console=False: sin consola, nada de stdout/stderr con datos sensibles.
@@ -26,7 +26,7 @@ exe = EXE(
     pyz,
     a.scripts,
     exclude_binaries=True,
-    name="Boveda",
+    name="VaultJam",
     debug=False,
     strip=False,
     upx=False,
@@ -39,5 +39,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="Boveda",
+    name="VaultJam",
 )

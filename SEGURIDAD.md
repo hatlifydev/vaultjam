@@ -76,7 +76,7 @@ a disco. Pero el SO puede hacerlo por su cuenta:
    al crear una bóveda ahí.
 8. **Bóvedas recientes (opcional)** — por comodidad, la pantalla de
    apertura puede recordar las últimas RUTAS de bóveda en el registro de
-   Windows (`HKCU\Software\Boveda`). No contienen contraseñas ni contenido,
+   Windows (`HKCU\Software\VaultJam`). No contienen contraseñas ni contenido,
    pero sí revelan que existen bóvedas y dónde (incluso si están en un USB
    desconectado). Es configurable con la casilla «Recordar las últimas
    bóvedas abiertas»: al desactivarla se borra la lista y no se guarda nada
