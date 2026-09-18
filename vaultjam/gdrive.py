@@ -152,10 +152,11 @@ class DriveStore:
 
     - Los listados de subcarpetas (blobs/xx/) se cachean: un solo listado
       por subcarpeta para mapear nombre→fileId, luego descargas directas.
-    - Caché LRU de blobs cifrados (~48 MiB) para que retroceder en un video
-      no re-descargue.
-    - Un lock serializa las llamadas HTTP: el cliente de Google no es
-      thread-safe, y aquí leen varios hilos (miniaturas, video, previews).
+    - Caché LRU de blobs cifrados para que retroceder en un video no
+      re-descargue.
+    - El cliente de Google no es thread-safe: cada hilo usa el SUYO
+      (_thread_svc). El lock protege solo las estructuras en memoria, nunca
+      una llamada de red, para que ninguna lectura bloquee a otra.
     """
 
     writable = False
@@ -192,24 +193,43 @@ class DriveStore:
 
     # ------------------------------------------------------------------
 
+    def _thread_svc(self):
+        """Cliente de Drive PROPIO de este hilo (httplib2 no es thread-safe).
+        Sin fábrica (apertura inicial) cae al único servicio compartido."""
+        if self._svc_factory is None:
+            return self._svc
+        svc = getattr(self._tls, "svc", None)
+        if svc is None:
+            svc = self._svc_factory()
+            self._tls.svc = svc
+        return svc
+
     def _list(self, folder_id: str) -> dict[str, str]:
+        # El lock protege SOLO la caché, JAMÁS la llamada de red: antes se
+        # sostenía durante el listado HTTP, así que abrir un video mientras
+        # una miniatura listaba su subcarpeta dejaba al video BLOQUEADO
+        # esperando ese lock -> "se queda pegado". Ahora la red va fuera del
+        # lock y con el cliente propio del hilo.
         with self._lock:
-            if folder_id in self._children:
-                return self._children[folder_id]
-            out: dict[str, str] = {}
-            token = None
-            while True:
-                res = self._svc.files().list(
-                    q=f"'{folder_id}' in parents and trashed=false",
-                    fields="nextPageToken,files(id,name)",
-                    pageSize=1000, pageToken=token).execute()
-                for f in res.get("files", []):
-                    out[f["name"]] = f["id"]
-                token = res.get("nextPageToken")
-                if not token:
-                    break
+            cached = self._children.get(folder_id)
+        if cached is not None:
+            return cached
+        svc = self._thread_svc()
+        out: dict[str, str] = {}
+        token = None
+        while True:
+            res = svc.files().list(
+                q=f"'{folder_id}' in parents and trashed=false",
+                fields="nextPageToken,files(id,name)",
+                pageSize=1000, pageToken=token).execute()
+            for f in res.get("files", []):
+                out[f["name"]] = f["id"]
+            token = res.get("nextPageToken")
+            if not token:
+                break
+        with self._lock:
             self._children[folder_id] = out
-            return out
+        return out
 
     @staticmethod
     def _download_with(svc, file_id: str) -> bytes:
@@ -222,16 +242,8 @@ class DriveStore:
         return buf.getvalue()
 
     def _download(self, file_id: str) -> bytes:
-        if self._svc_factory is not None:
-            # Cliente propio de este hilo: descargas simultáneas reales
-            # (el cliente de Google no es thread-safe, pero uno por hilo sí).
-            svc = getattr(self._tls, "svc", None)
-            if svc is None:
-                svc = self._svc_factory()
-                self._tls.svc = svc
-            return self._download_with(svc, file_id)
-        with self._lock:   # un solo servicio: serializar como antes
-            return self._download_with(self._svc, file_id)
+        # Descarga con el cliente del hilo, SIN lock: paralelismo real.
+        return self._download_with(self._thread_svc(), file_id)
 
     def prefetch(self, blob_ids: list[str]) -> None:
         """Pre-descarga en segundo plano: el lector de video la invoca con
@@ -285,6 +297,7 @@ class DriveStore:
         subs = [fid for name, fid in self._list(self._blobs_id).items()
                 if len(name) == 2]
         out: set[str] = set()
+        svc = self._thread_svc()          # cliente del hilo, sin lock de red
         GROUP = 40
         for i in range(0, len(subs), GROUP):
             clause = " or ".join(f"'{sid}' in parents"
@@ -292,10 +305,9 @@ class DriveStore:
             q = f"({clause}) and trashed=false"
             token = None
             while True:
-                with self._lock:
-                    res = self._svc.files().list(
-                        q=q, fields="nextPageToken,files(name)",
-                        pageSize=1000, pageToken=token).execute()
+                res = svc.files().list(
+                    q=q, fields="nextPageToken,files(name)",
+                    pageSize=1000, pageToken=token).execute()
                 for f in res.get("files", []):
                     n = f["name"]
                     if n.endswith(".blob"):
