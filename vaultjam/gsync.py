@@ -21,6 +21,8 @@ Propiedades del algoritmo:
 
 from __future__ import annotations
 
+import concurrent.futures as cf
+import threading
 from pathlib import Path
 
 from . import crypto_core as cc
@@ -119,12 +121,19 @@ class DriveOps:
 
 class DriveSyncer:
     def __init__(self, ops, root: Path, expected_blob_ids: list[str],
-                 folder_name: str | None = None, folder_hint: str | None = None):
+                 folder_name: str | None = None, folder_hint: str | None = None,
+                 ops_factory=None, workers: int = 1):
+        """Con ops_factory y workers>1, los blobs se suben EN PARALELO:
+        cada hilo obtiene su propio DriveOps de la fábrica (el cliente de
+        Google no es thread-safe). La subida secuencial estaba limitada por
+        la latencia por petición, no por el ancho de banda."""
         self.ops = ops
         self.root = Path(root)
         self.expected = list(dict.fromkeys(expected_blob_ids))
         self.folder_name = folder_name or self.root.name
         self.folder_hint = folder_hint
+        self.ops_factory = ops_factory
+        self.workers = max(1, int(workers))
 
     def _resolve_folder(self, create: bool = True) -> str:
         # 1) la carpeta usada la última vez, si sigue existiendo
@@ -189,27 +198,89 @@ class DriveSyncer:
         total = len(plan)
         progress(0, total)
 
-        uploaded = corrected = 0
-        for i, (b, existing) in enumerate(plan):
-            if cancelled():
-                # Cancelar es seguro: el índice NO se ha tocado; lo subido
-                # queda aprovechado para la próxima ejecución.
-                return {"cancelado": True, "subidos": uploaded,
-                        "pendientes": total - i, "total": len(self.expected),
-                        "folder_id": fid}
-            sub = b[:2]
-            sid = sub_ids.get(sub)
-            if sid is None:
-                sid = self.ops.create_folder(blobs_id, sub)
-                sub_ids[sub] = sid
-            status(f"Subiendo blob {i + 1} de {total}…")
-            self.ops.upload(sid, f"{b}.blob", self.root / "blobs" / sub / f"{b}.blob",
-                            existing_id=existing)
-            if existing:
-                corrected += 1
-            uploaded += 1
-            progress(uploaded, total)
+        # Las subcarpetas que falten se crean ANTES y en secuencia: crearlas
+        # desde varios hilos a la vez duplicaría carpetas en Drive.
+        for sub in sorted({b[:2] for b, _ in plan} - set(sub_ids)):
+            sub_ids[sub] = self.ops.create_folder(blobs_id, sub)
 
+        if total and self.workers > 1 and self.ops_factory is not None:
+            uploaded, corrected = self._upload_parallel(
+                plan, sub_ids, progress, status, cancelled)
+        else:
+            uploaded = corrected = 0
+            for i, (b, existing) in enumerate(plan):
+                if cancelled():
+                    break
+                status(f"Subiendo blob {i + 1} de {total}…")
+                self.ops.upload(sub_ids[b[:2]], f"{b}.blob",
+                                self.root / "blobs" / b[:2] / f"{b}.blob",
+                                existing_id=existing)
+                if existing:
+                    corrected += 1
+                uploaded += 1
+                progress(uploaded, total)
+        if cancelled():
+            # Cancelar es seguro: el índice NO se ha tocado; lo subido
+            # queda aprovechado para la próxima ejecución.
+            return {"cancelado": True, "subidos": uploaded,
+                    "pendientes": total - uploaded,
+                    "total": len(self.expected), "folder_id": fid}
+
+        return self._commit_and_verify(fid, blobs_id, root_children,
+                                       uploaded, corrected, status)
+
+    def _upload_parallel(self, plan, sub_ids, progress, status, cancelled):
+        """Sube el plan con un pool de hilos; DriveOps por hilo vía la
+        fábrica. Al cancelar, las tareas no arrancadas se descartan y las
+        en vuelo terminan su blob (estado siempre consistente)."""
+        local = threading.local()
+
+        def ops_for_thread():
+            if getattr(local, "ops", None) is None:
+                local.ops = self.ops_factory()
+            return local.ops
+
+        stop = threading.Event()
+
+        def task(item):
+            if stop.is_set():
+                return None
+            b, existing = item
+            ops_for_thread().upload(
+                sub_ids[b[:2]], f"{b}.blob",
+                self.root / "blobs" / b[:2] / f"{b}.blob",
+                existing_id=existing)
+            return existing is not None
+
+        total = len(plan)
+        done = corrected = 0
+        errors: list[Exception] = []
+        with cf.ThreadPoolExecutor(max_workers=self.workers) as ex:
+            futs = [ex.submit(task, it) for it in plan]
+            for f in cf.as_completed(futs):
+                if cancelled() and not stop.is_set():
+                    stop.set()
+                try:
+                    r = f.result()
+                except Exception as e:  # noqa: BLE001
+                    errors.append(e)
+                    continue
+                if r is None:
+                    continue            # descartada por cancelación
+                done += 1
+                if r:
+                    corrected += 1
+                status(f"Subiendo… {done} de {total} "
+                       f"({self.workers} en paralelo)")
+                progress(done, total)
+        if errors and not stop.is_set():
+            raise RuntimeError(
+                f"{len(errors)} blobs fallaron al subir tras reintentos "
+                f"(vuelve a sincronizar): {errors[0]}")
+        return done, corrected
+
+    def _commit_and_verify(self, fid, blobs_id, root_children,
+                           uploaded, corrected, status) -> dict:
         # Punto de commit: header y, en último lugar, el índice.
         status("Actualizando header e índice…")
         self.ops.upload(fid, "header.json", self.root / "header.json",

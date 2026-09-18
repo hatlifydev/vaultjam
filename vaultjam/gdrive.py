@@ -34,15 +34,18 @@ TOKEN_PATH = APPDIR / "token.json"        # token de SOLO LECTURA (abrir remotas
 TOKEN_RW_PATH = APPDIR / "token_rw.json"  # token de escritura (solo sincronizar)
 
 
-def get_service(client_secret_path: str, readonly: bool = True):
-    """Autentica (abre el navegador la primera vez) y devuelve el cliente
-    de la API de Drive. Tokens SEPARADOS por nivel de permiso: abrir
-    bóvedas remotas usa solo-lectura; sincronizar pide escritura aparte,
-    así el token de uso diario nunca puede modificar tu Drive."""
+def get_credentials(client_secret_path: str, readonly: bool = True):
+    """Autentica (abre el navegador la primera vez) y devuelve las
+    credenciales. Tokens SEPARADOS por nivel de permiso: abrir bóvedas
+    remotas usa solo-lectura; sincronizar pide escritura aparte, así el
+    token de uso diario nunca puede modificar tu Drive.
+
+    Se separa del servicio porque el cliente HTTP de Google NO es
+    thread-safe: la subida en paralelo construye un servicio por hilo a
+    partir de estas mismas credenciales."""
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
-    from googleapiclient.discovery import build
 
     scopes = SCOPES_RO if readonly else SCOPES_RW
     token_path = TOKEN_PATH if readonly else TOKEN_RW_PATH
@@ -77,7 +80,17 @@ def get_service(client_secret_path: str, readonly: bool = True):
                 "Vuelve a intentarlo y elige la cuenta correcta.")
         APPDIR.mkdir(parents=True, exist_ok=True)
         token_path.write_text(creds.to_json(), encoding="utf-8")
+    return creds
+
+
+def build_service(creds):
+    """Un cliente de la API por hilo (httplib2 no es thread-safe)."""
+    from googleapiclient.discovery import build
     return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def get_service(client_secret_path: str, readonly: bool = True):
+    return build_service(get_credentials(client_secret_path, readonly))
 
 
 def forget_token() -> None:

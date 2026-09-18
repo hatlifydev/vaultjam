@@ -3,6 +3,7 @@ implementa la misma interfaz que DriveOps. Cubre: espejo completo, segunda
 pasada sin re-subidas, corrección de blobs corruptos, cancelación segura
 (índice intacto) y que el espejo resultante es una bóveda remota usable."""
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -23,13 +24,15 @@ class MemOps:
     def __init__(self):
         self._n = 0
         self.nodes: dict[str, dict] = {}   # id -> {name,parent,folder,data}
+        self._mutex = threading.Lock()     # la subida paralela escribe aquí
 
     def _new(self, name, parent, folder, data=b""):
-        self._n += 1
-        nid = f"n{self._n}"
-        self.nodes[nid] = {"name": name, "parent": parent,
-                           "folder": folder, "data": data}
-        return nid
+        with self._mutex:
+            self._n += 1
+            nid = f"n{self._n}"
+            self.nodes[nid] = {"name": name, "parent": parent,
+                               "folder": folder, "data": data}
+            return nid
 
     def find_folders(self, name):
         return [i for i, d in self.nodes.items()
@@ -54,7 +57,8 @@ class MemOps:
     def upload(self, parent_id, name, path, existing_id=None):
         data = Path(path).read_bytes()
         if existing_id:
-            self.nodes[existing_id]["data"] = data
+            with self._mutex:
+                self.nodes[existing_id]["data"] = data
             return existing_id
         return self._new(name, parent_id, False, data)
 
@@ -148,6 +152,51 @@ def test_sync_cancel_leaves_index_untouched(synced):
     # reanudar termina el trabajo
     s2 = DriveSyncer(ops, vault.root, vault.all_blob_ids(),
                      folder_name="v.vault").sync()
+    assert not s2["cancelado"]
+    assert s2["subidos"] == s["pendientes"]
+
+
+def test_sync_parallel_full_mirror(synced):
+    """El camino paralelo (workers>1 + fábrica de ops) produce exactamente
+    el mismo espejo que el secuencial, usable como bóveda remota."""
+    vault, ops, _seq, original = synced
+    n = len(vault.all_blob_ids())
+    syncer = DriveSyncer(ops, vault.root, vault.all_blob_ids(),
+                         folder_name="v.vault",
+                         ops_factory=lambda: ops, workers=4)
+    s = syncer.sync()
+    assert not s["cancelado"] and s["subidos"] == n
+    assert s["ok_blobs"] == set(vault.all_blob_ids())
+    rv = Vault.open_remote(MemRemoteStore(ops, s["folder_id"]), PW)
+    ev = next(e for e in rv.entries() if e.mime == "video")
+    assert rv.open_reader(ev.id).read(-1) == original
+    # segunda pasada paralela: idempotente
+    s2 = DriveSyncer(ops, vault.root, vault.all_blob_ids(),
+                     folder_name="v.vault",
+                     ops_factory=lambda: ops, workers=4).sync()
+    assert s2["subidos"] == 0 and s2["ya_presentes"] == n
+
+
+def test_sync_parallel_cancel_keeps_index_untouched(synced):
+    vault, ops, _seq, _ = synced
+    calls = {"n": 0}
+
+    def cancel_soon():
+        calls["n"] += 1
+        return calls["n"] > 1
+
+    s = DriveSyncer(ops, vault.root, vault.all_blob_ids(),
+                    folder_name="v.vault",
+                    ops_factory=lambda: ops, workers=4).sync(
+        cancelled=cancel_soon)
+    assert s["cancelado"]
+    assert s["subidos"] + s["pendientes"] == s["total"]
+    names = {d["name"] for d in ops.nodes.values()}
+    assert "index.enc" not in names and "header.json" not in names
+    # reanudar en paralelo completa el espejo
+    s2 = DriveSyncer(ops, vault.root, vault.all_blob_ids(),
+                     folder_name="v.vault",
+                     ops_factory=lambda: ops, workers=4).sync()
     assert not s2["cancelado"]
     assert s2["subidos"] == s["pendientes"]
 

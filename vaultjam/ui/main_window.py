@@ -90,13 +90,19 @@ class _SyncWorker(QThread):
 
     def run(self):
         try:
-            from ..gdrive import get_service
+            from ..gdrive import build_service, get_credentials
             from ..gsync import DriveOps, DriveSyncer
             self.status.emit("Autorizando con Google (permiso de escritura)…")
-            svc = get_service(self._secret, readonly=False)
-            syncer = DriveSyncer(DriveOps(svc), self._root, self._blob_ids,
+            creds = get_credentials(self._secret, readonly=False)
+            # 6 subidas en paralelo: un cliente HTTP por hilo (el de Google
+            # no es thread-safe). La subida secuencial estaba limitada por
+            # latencia, no por ancho de banda: esto la acelera ~4-6x.
+            syncer = DriveSyncer(DriveOps(build_service(creds)),
+                                 self._root, self._blob_ids,
                                  folder_name=self._folder_name,
-                                 folder_hint=self._hint)
+                                 folder_hint=self._hint,
+                                 ops_factory=lambda: DriveOps(build_service(creds)),
+                                 workers=6)
             self.finished_ok.emit(syncer.sync(
                 progress=lambda d, t: self.progress.emit(d, t),
                 status=lambda m: self.status.emit(m),
