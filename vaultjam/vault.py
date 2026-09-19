@@ -15,7 +15,9 @@ La capa de UI solo habla con la clase Vault; nunca toca claves ni AEADs.
 
 from __future__ import annotations
 
+import copy
 import hashlib
+import hmac
 import io
 import json
 import math
@@ -455,6 +457,95 @@ class Vault:
         capturado en el visor): jamás pasa por el disco en claro."""
         return self._import_stream(io.BytesIO(data), len(data), name,
                                    time.time(), mime, thumb_jpeg, folder)
+
+    # ------------------------------------------------------------------
+    # Traer desde la nube (orquestado por gpull.CloudImport)
+    # ------------------------------------------------------------------
+
+    def same_master_key(self, other: "Vault") -> bool:
+        """True si ESTA bóveda y `other` comparten clave maestra ⇒ son la
+        MISMA bóveda (aunque una esté en Drive). Comparación en tiempo
+        constante para no filtrar por temporización. Ambas deben estar
+        desbloqueadas."""
+        if self._mk is None or getattr(other, "_mk", None) is None:
+            return False
+        return hmac.compare_digest(bytes(self._mk), bytes(other._mk))
+
+    def ensure_folder(self, name: str) -> None:
+        """Añade una carpeta (plana) al índice si falta; idempotente. No
+        valida como create_folder porque el nombre proviene de otra bóveda
+        ya existente, no de una entrada del usuario. El caller persiste."""
+        if name and name not in self._folders:
+            self._folders.append(name)
+
+    def find_duplicate(self, name: str, size: int, mtime: float,
+                       folder: str) -> bool:
+        """¿Ya existe una entrada equivalente? Dedup del modo importar para
+        que reintentar no cree copias. Igualdad por (nombre, tamaño, fecha,
+        carpeta): barato y sin descargar/descifrar nada."""
+        for e in self._entries.values():
+            if (e.name == name and e.size == size and e.folder == folder
+                    and int(e.mtime) == int(mtime)):
+                return True
+        return False
+
+    def graft_ciphertext_entry(self, entry: FileEntry, src_store,
+                               cancelled=lambda: False) -> str:
+        """MODO ESPEJO (misma clave maestra): copia el CIPHERTEXT de los
+        blobs de esta entrada que falten en local —conservando su id— y
+        añade/repara la entrada en el índice. No descifra: solo mueve bytes
+        ya cifrados, así que ni siquiera usa la clave. Dedup por id de
+        entrada. Devuelve 'added' | 'repaired' | 'skipped'."""
+        self._require_writable()
+        ids = list(entry.chunks) + ([entry.thumb] if entry.thumb else [])
+        copied = 0
+        for bid in ids:
+            if cancelled():
+                raise VaultError("Cancelado.")
+            if not self.store.exists(bid):
+                self.store.put(bid, src_store.read(bid))   # ciphertext tal cual
+                copied += 1
+        with self._lock:
+            existed = entry.id in self._entries
+            if not existed:
+                self.ensure_folder(entry.folder)
+                self._entries[entry.id] = copy.deepcopy(entry)
+            self._save_index()
+        return "added" if not existed else ("repaired" if copied else "skipped")
+
+    def import_decrypted_entry(self, src_vault: "Vault", entry: FileEntry,
+                               folder: str | None = None,
+                               cancelled=lambda: False) -> FileEntry | None:
+        """MODO IMPORTAR (bóveda distinta): descifra el contenido de la
+        bóveda de ORIGEN en RAM (jamás a disco, igual que el visor) y lo
+        reingiere re-cifrado bajo la clave de ESTA bóveda (blobs e id
+        nuevos). Conserva ajustes cosméticos (marcadores, rotación, favorito,
+        ajustes de imagen). Dedup por (nombre, tamaño, fecha, carpeta).
+        Devuelve la entrada nueva, o None si era duplicado."""
+        self._require_writable()
+        dst_folder = entry.folder if folder is None else folder
+        if self.find_duplicate(entry.name, entry.size, entry.mtime, dst_folder):
+            return None
+        # El lector descifra por streaming: el texto plano transita RAM
+        # chunk a chunk, nunca hay una copia entera ni un temporal en claro.
+        reader = src_vault.open_reader(entry.id)
+        try:
+            thumb = src_vault.read_thumb(entry.id)
+        except Exception:
+            thumb = None
+        self.ensure_folder(dst_folder)
+        new = self._import_stream(reader, entry.size, entry.name, entry.mtime,
+                                  entry.mime, thumb, dst_folder)
+        with self._lock:
+            new.marks = copy.deepcopy(entry.marks)
+            new.rotation = entry.rotation
+            new.favorite = entry.favorite
+            new.thumb_rotation = entry.thumb_rotation
+            new.thumb_scale = entry.thumb_scale
+            new.adjust = dict(entry.adjust)
+            new.flip_h, new.flip_v = entry.flip_h, entry.flip_v
+            self._save_index()
+        return new
 
     def _write_thumb_blob(self, keys: cc.SubKeys, file_id: bytes,
                           thumb_jpeg: bytes) -> str:

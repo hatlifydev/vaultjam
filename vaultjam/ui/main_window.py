@@ -378,7 +378,14 @@ class MainWindow(QMainWindow):
                 "Drive: marco verde = subido entero, rojo = aún incompleto. "
                 "Solo lee listados; no sube nada.")
             self._act_mirror.triggered.connect(self._check_mirror)
+            self._act_pull = QAction("⬇️ Traer desde la nube…", self)
+            self._act_pull.setToolTip(
+                "Traer contenido desde Google Drive a ESTA bóveda local: del "
+                "propio espejo (rellenar lo que falte) o de OTRA bóveda de "
+                "Drive (importar re-cifrando bajo tu clave). Solo lee Drive.")
+            self._act_pull.triggered.connect(self._pull_from_cloud)
             self._more_menu.insertAction(self._act_pin, self._act_mirror)
+            self._more_menu.insertAction(self._act_pin, self._act_pull)
             self._more_menu.insertSeparator(self._act_pin)
         self._sync_worker: _SyncWorker | None = None
         self._mirror_worker: _MirrorCheckWorker | None = None
@@ -626,6 +633,23 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"No se pudo comprobar Drive: {result}")
 
     # ---------------- carpetas ----------------
+
+    def _pull_from_cloud(self):
+        """Abre el diálogo modal «Traer desde la nube» (nube→local, misma
+        bóveda o importar desde otra). Se pausa el auto-bloqueo mientras dura
+        —operación explícita que puede descargar y re-cifrar largo rato— y al
+        cerrar se recarga la galería si trajo algo."""
+        if self._vault.read_only:
+            return
+        from .pull_dialog import PullFromCloudDialog
+        self._autolock.stop()
+        try:
+            dlg = PullFromCloudDialog(self._vault, self)
+            dlg.exec()
+            if getattr(dlg, "changed", False):
+                self._reload_sidebar()      # nuevas carpetas/elementos y contadores
+        finally:
+            self._reset_autolock()
 
     def _current_folder(self) -> str | None:
         """None = 'Todo'; "" = sin carpeta; otro valor = nombre de carpeta."""

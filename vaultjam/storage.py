@@ -83,8 +83,16 @@ class BlobStore:
 
     def write(self, data: bytes) -> str:
         """Escribe un blob (YA cifrado por la capa superior) de forma atómica
-        y con marcas de tiempo normalizadas. Devuelve su id."""
+        y con marcas de tiempo normalizadas. Devuelve su id (aleatorio)."""
         blob_id = self.new_blob_id()
+        self.put(blob_id, data)
+        return blob_id
+
+    def put(self, blob_id: str, data: bytes) -> None:
+        """Escribe un blob YA CIFRADO bajo un id CONCRETO (no aleatorio).
+        Lo usa la traída desde la nube en modo espejo: copia el ciphertext
+        tal cual, conservando el id que la entrada del índice referencia.
+        Atómico y con timestamps normalizados, igual que write()."""
         dest = self.path_for(blob_id)
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_suffix(".tmp")
@@ -95,10 +103,12 @@ class BlobStore:
         os.replace(tmp, dest)
         os.utime(dest, (FIXED_TS, FIXED_TS))
         _set_creation_time_windows(dest, FIXED_TS)
-        return blob_id
 
     def read(self, blob_id: str) -> bytes:
         return self.path_for(blob_id).read_bytes()
+
+    def exists(self, blob_id: str) -> bool:
+        return self.path_for(blob_id).exists()
 
     def delete(self, blob_id: str) -> None:
         # Borrado normal del sistema de archivos. NO es un borrado seguro:
