@@ -472,18 +472,25 @@ class Vault:
         return hmac.compare_digest(bytes(self._mk), bytes(other._mk))
 
     def ensure_folder(self, name: str) -> None:
-        """Añade una carpeta (plana) al índice si falta; idempotente. No
-        valida como create_folder porque el nombre proviene de otra bóveda
-        ya existente, no de una entrada del usuario. El caller persiste."""
-        if name and name not in self._folders:
-            self._folders.append(name)
+        """Añade una carpeta (plana) al índice si falta; idempotente y
+        seguro entre hilos (traída en paralelo). No valida como
+        create_folder porque el nombre proviene de otra bóveda ya existente,
+        no de una entrada del usuario. El caller persiste el índice."""
+        if not name:
+            return
+        with self._lock:
+            if name not in self._folders:
+                self._folders.append(name)
 
     def find_duplicate(self, name: str, size: int, mtime: float,
                        folder: str) -> bool:
         """¿Ya existe una entrada equivalente? Dedup del modo importar para
         que reintentar no cree copias. Igualdad por (nombre, tamaño, fecha,
-        carpeta): barato y sin descargar/descifrar nada."""
-        for e in self._entries.values():
+        carpeta): barato y sin descargar/descifrar nada. Itera sobre una
+        instantánea bajo lock (otras traídas en paralelo mutan el índice)."""
+        with self._lock:
+            entries = list(self._entries.values())
+        for e in entries:
             if (e.name == name and e.size == size and e.folder == folder
                     and int(e.mtime) == int(mtime)):
                 return True
@@ -508,7 +515,11 @@ class Vault:
         with self._lock:
             existed = entry.id in self._entries
             if not existed:
-                self.ensure_folder(entry.folder)
+                # Añadir la carpeta AQUÍ mismo (ya tenemos el lock): llamar a
+                # ensure_folder lo re-tomaría y self._lock NO es reentrante
+                # (threading.Lock) → se auto-bloquearía.
+                if entry.folder and entry.folder not in self._folders:
+                    self._folders.append(entry.folder)
                 self._entries[entry.id] = copy.deepcopy(entry)
             self._save_index()
         return "added" if not existed else ("repaired" if copied else "skipped")
@@ -563,46 +574,51 @@ class Vault:
         file_id = cc.random_bytes(16)
         total = max(1, math.ceil(size / cc.CHUNK_SIZE))
 
+        # El cifrado y la escritura de blobs NO necesitan el lock: cada blob
+        # tiene id aleatorio propio y su archivo es independiente. Dejarlos
+        # FUERA del lock permite que varias importaciones avancen a la vez
+        # (traer desde la nube en paralelo); el lock solo protege el alta
+        # atómica en el índice compartido.
         chunk_ids: list[str] = []
-        with self._lock:
-            try:
-                for idx in range(total):
-                    chunk = f.read(cc.CHUNK_SIZE)
-                    if len(chunk) < cc.CHUNK_SIZE:
-                        # Relleno con ceros hasta el tamaño fijo. La
-                        # longitud real vive solo en el índice cifrado:
-                        # en disco todos los blobs son idénticos.
-                        chunk = chunk + b"\x00" * (cc.CHUNK_SIZE - len(chunk))
-                    sealed = cc.seal(
-                        keys.content, chunk, cc.chunk_aad(file_id, idx, total)
-                    )
-                    chunk_ids.append(self.store.write(sealed))
-
-                thumb_id = None
-                if thumb_jpeg is not None:
-                    # La miniatura también se rellena al tamaño de chunk:
-                    # si fuera más pequeña, contar "blobs chicos" revelaría
-                    # cuántos archivos hay en la bóveda.
-                    thumb_id = self._write_thumb_blob(keys, file_id, thumb_jpeg)
-
-                entry = FileEntry(
-                    id=file_id.hex(),
-                    name=name,
-                    folder=folder,
-                    size=size,
-                    mtime=mtime,
-                    mime=mime,
-                    chunks=chunk_ids,
-                    thumb=thumb_id,
+        try:
+            for idx in range(total):
+                chunk = f.read(cc.CHUNK_SIZE)
+                if len(chunk) < cc.CHUNK_SIZE:
+                    # Relleno con ceros hasta el tamaño fijo. La longitud
+                    # real vive solo en el índice cifrado: en disco todos los
+                    # blobs son idénticos.
+                    chunk = chunk + b"\x00" * (cc.CHUNK_SIZE - len(chunk))
+                sealed = cc.seal(
+                    keys.content, chunk, cc.chunk_aad(file_id, idx, total)
                 )
+                chunk_ids.append(self.store.write(sealed))
+
+            thumb_id = None
+            if thumb_jpeg is not None:
+                # La miniatura también se rellena al tamaño de chunk: si
+                # fuera más pequeña, contar "blobs chicos" revelaría cuántos
+                # archivos hay en la bóveda.
+                thumb_id = self._write_thumb_blob(keys, file_id, thumb_jpeg)
+
+            entry = FileEntry(
+                id=file_id.hex(),
+                name=name,
+                folder=folder,
+                size=size,
+                mtime=mtime,
+                mime=mime,
+                chunks=chunk_ids,
+                thumb=thumb_id,
+            )
+            with self._lock:                 # solo el índice: alta + guardado
                 self._entries[entry.id] = entry
                 self._save_index()
-                return entry
-            except BaseException:
-                # Importación fallida o cancelada: no dejar blobs huérfanos.
-                for cid in chunk_ids:
-                    self.store.delete(cid)
-                raise
+            return entry
+        except BaseException:
+            # Importación fallida o cancelada: no dejar blobs huérfanos.
+            for cid in chunk_ids:
+                self.store.delete(cid)
+            raise
 
     def set_thumb(self, entry_id: str, thumb_jpeg: bytes) -> None:
         """Reemplaza la miniatura (p.ej. «usar este fotograma»): sella el

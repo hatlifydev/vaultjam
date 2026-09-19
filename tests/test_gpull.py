@@ -78,7 +78,10 @@ def test_mirror_mode_same_vault_restores_missing(tmp_path):
     v_dir = tmp_path / "V.vault"
     v = _make_vault(v_dir, "misma-clave")
     payload = b"pixeles" * 40000
-    e0 = v.import_bytes("clip.mp4", payload, "video", b"thumb", folder="")
+    # Carpeta NO vacía a propósito: el injerto añade la carpeta al índice
+    # mientras sostiene el lock, lo que destapó un auto-bloqueo (lock no
+    # reentrante). Con "" el fallo se escondía.
+    e0 = v.import_bytes("clip.mp4", payload, "video", b"thumb", folder="peliculas")
     eid, chunk_ids, thumb_id = e0.id, list(e0.chunks), e0.thumb
 
     # "Espejo" en la nube = copia íntegra de V.
@@ -107,6 +110,35 @@ def test_mirror_mode_same_vault_restores_missing(tmp_path):
 
     # Reintentar: ya está todo ⇒ omitido.
     assert imp.run([eid])["omitidos"] == 1
+
+
+def test_import_parallel_many_entries(tmp_path):
+    # Origen con varios archivos de contenido distinto; se traen en paralelo.
+    src_dir = tmp_path / "orig.vault"
+    src = _make_vault(src_dir, "po")
+    originales = {}
+    for i in range(9):
+        data = bytes([i]) * (7000 + i * 137)      # tamaños/contenidos únicos
+        e = src.import_bytes(f"f{i}.jpg", data, "image", b"t", folder="lote")
+        originales[f"f{i}.jpg"] = data
+    src.lock()
+
+    dst = _make_vault(tmp_path / "dst.vault", "pd")
+    imp = CloudImport(Vault.open_remote(DirRemote(src_dir), "po"), dst)
+    ids = [e.id for e in imp.src.entries()]
+
+    res = imp.run(ids, workers=6)
+    assert res["importados"] == 9 and res["omitidos"] == 0 and not res["errores"]
+
+    got = dst.entries(folder="lote")
+    assert len(got) == 9                            # sin duplicados ni pérdidas
+    for e in got:                                   # cada uno descifra a su original
+        assert dst.open_reader(e.id).read(-1) == originales[e.name]
+
+    # Reintento en paralelo: todo deduplicado, nada nuevo.
+    res2 = imp.run(ids, workers=6)
+    assert res2["importados"] == 0 and res2["omitidos"] == 9
+    assert len(dst.entries(folder="lote")) == 9
 
 
 def test_same_master_key_detection(tmp_path):

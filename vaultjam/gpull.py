@@ -24,6 +24,11 @@ Propiedades:
 
 from __future__ import annotations
 
+import concurrent.futures as cf
+import threading
+
+PARALLEL_WORKERS = 6   # igual que la subida: el cuello es la latencia, no la CPU
+
 
 class CloudImport:
     def __init__(self, src_vault, dst_vault):
@@ -46,53 +51,75 @@ class CloudImport:
             out.setdefault(e.folder, []).append(e)
         return out
 
+    def _do_one(self, eid, folder_override, should_stop):
+        """Trae UN elemento (se ejecuta en un hilo del pool). Toda la I/O de
+        red y el cifrado ocurren aquí, en paralelo; el alta en el índice la
+        serializa el propio Vault con su lock estrecho. Devuelve la clave del
+        contador ('añadidos'|'reparados'|'importados'|'omitidos') y la
+        entrada, o None si se saltó por parada."""
+        if should_stop():
+            return None
+        e = self.src.get(eid)   # KeyError improbable: ids vienen del origen
+        if self.same_vault:
+            r = self.dst.graft_ciphertext_entry(e, self.src.store, should_stop)
+            key = {"added": "añadidos", "repaired": "reparados",
+                   "skipped": "omitidos"}[r]
+        else:
+            new = self.dst.import_decrypted_entry(
+                self.src, e, folder=folder_override, cancelled=should_stop)
+            key = "omitidos" if new is None else "importados"
+        return key, e
+
     def run(self, selected_ids, *, folder_override: str | None = None,
+            workers: int = PARALLEL_WORKERS,
             progress=lambda done, total: None,
             status=lambda msg: None,
             cancelled=lambda: False,
             item_done=lambda entry: None) -> dict:
-        """Trae los elementos seleccionados. folder_override (solo modo
-        importar) mete todo en una carpeta de destino concreta; None conserva
-        la carpeta de origen. En modo espejo se ignora (los ids deben coincidir
-        exactamente con los del origen)."""
+        """Trae los elementos seleccionados EN PARALELO (pool de `workers`
+        hilos), igual que la subida: el límite es la latencia por petición,
+        no la CPU. folder_override (solo modo importar) mete todo en una
+        carpeta destino; None conserva la de origen. En modo espejo se ignora.
+
+        Las descargas/descifrado/escritura corren en los hilos del pool; los
+        callbacks (progress/status/item_done) se invocan SIEMPRE desde este
+        hilo orquestador conforme completan, para que la UI reciba señales
+        desde un único hilo (como hace el sincronizador de subida)."""
         ids = list(dict.fromkeys(selected_ids))
         total = len(ids)
         progress(0, total)
-        added = repaired = imported = skipped = 0
+        counters = {"añadidos": 0, "reparados": 0, "importados": 0, "omitidos": 0}
         errors: list[str] = []
-        for i, eid in enumerate(ids):
-            if cancelled():
-                break
-            try:
-                e = self.src.get(eid)
-            except KeyError:
-                continue
-            verbo = "Copiando" if self.same_vault else "Importando"
-            status(f"{verbo} «{e.name}» ({i + 1} de {total})…")
-            try:
-                if self.same_vault:
-                    r = self.dst.graft_ciphertext_entry(e, self.src.store, cancelled)
-                    if r == "added":
-                        added += 1
-                    elif r == "repaired":
-                        repaired += 1
-                    else:
-                        skipped += 1
-                else:
-                    new = self.dst.import_decrypted_entry(
-                        self.src, e, folder=folder_override, cancelled=cancelled)
-                    if new is None:
-                        skipped += 1
-                    else:
-                        imported += 1
-                item_done(e)
-            except Exception as ex:  # noqa: BLE001 — un fallo por elemento no aborta el lote
-                errors.append(f"{e.name}: {ex}")
-            progress(i + 1, total)
+        stop = threading.Event()
+
+        def should_stop():
+            return stop.is_set() or cancelled()
+
+        verbo = "Copiando" if self.same_vault else "Importando"
+        done = 0
+        with cf.ThreadPoolExecutor(
+                max_workers=max(1, int(workers)),
+                thread_name_prefix="vj-pull") as ex:
+            futs = {ex.submit(self._do_one, eid, folder_override, should_stop): eid
+                    for eid in ids}
+            for fut in cf.as_completed(futs):
+                if cancelled() and not stop.is_set():
+                    stop.set()   # las tareas no arrancadas se descartan al iniciar
+                done += 1
+                try:
+                    res = fut.result()
+                except Exception as exc:  # noqa: BLE001 — un fallo no aborta el lote
+                    errors.append(str(exc))
+                    res = None
+                if res is not None:
+                    key, e = res
+                    counters[key] += 1
+                    item_done(e)
+                status(f"{verbo}… {done} de {total} ({max(1, int(workers))} en paralelo)")
+                progress(done, total)
         return {
             "cancelado": bool(cancelled()),
             "modo": self.mode,
-            "añadidos": added, "reparados": repaired,
-            "importados": imported, "omitidos": skipped,
+            **counters,
             "errores": errors, "total": total,
         }
