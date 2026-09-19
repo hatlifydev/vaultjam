@@ -83,6 +83,12 @@ a disco. Pero el SO puede hacerlo por su cuenta:
    más; el botón «Olvidar» borra la lista sin desactivar la función. De
    todos modos, una carpeta `.vault` en el disco ya es visible por sí
    misma: la bóveda no ofrece negación plausible.
+9. **Cambiar la contraseña y copias históricas** — cambiarla vuelve a envolver
+   la misma clave maestra, sin recifrar gigabytes de contenido. Una copia de
+   seguridad o versión histórica del `header.json` anterior seguirá aceptando
+   la contraseña anterior junto con los blobs correspondientes. Para revocar
+   por completo una contraseña expuesta hay que crear una bóveda nueva y
+   trasladar el contenido a ella.
 
 **La mitigación de fondo para 1–5 es cifrado de disco completo (BitLocker).**
 Con BitLocker activo, pagefile, hiberfil, volcados y restos de originales

@@ -25,6 +25,7 @@ import os
 import struct
 import threading
 import time
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,10 +36,65 @@ from .storage import FIXED_TS, BlobStore, _set_creation_time_windows
 HEADER_NAME = "header.json"
 INDEX_NAME = "index.enc"
 INDEX_MIN_PAD = 4096
+MAX_HEADER_SIZE = 64 * 1024
+MIN_NEW_PASSWORD_LEN = 14
+
+# Límites defensivos para parámetros leídos de un header no confiable. El
+# mínimo conserva compatibilidad con bóvedas de pruebas/antiguas; la UI crea
+# bóvedas nuevas con ARGON2_DEFAULTS (256 MiB). El máximo evita que un header
+# manipulado fuerce asignaciones de memoria o trabajo absurdos antes de que
+# GCM pueda detectar la manipulación.
+KDF_LIMITS = {
+    # El mínimo bajo existe solo para poder abrir formatos/pruebas antiguas;
+    # las creaciones normales siguen usando 256 MiB. El límite relevante
+    # frente a headers hostiles es el máximo.
+    "m_kib": (8, 1024 * 1024),  # 8 KiB .. 1 GiB
+    "t": (1, 20),
+    "p": (1, 64),
+}
 
 
 class VaultError(Exception):
     pass
+
+
+def validate_new_password(password: str) -> None:
+    """Política para contraseñas NUEVAS; abrir bóvedas antiguas no la usa."""
+    if len(password) < MIN_NEW_PASSWORD_LEN:
+        raise VaultError(
+            f"La contraseña debe tener al menos {MIN_NEW_PASSWORD_LEN} caracteres. "
+            "Se recomienda una frase larga, única y difícil de adivinar."
+        )
+
+
+def _validate_kdf_values(params: dict) -> None:
+    try:
+        for name, (lo, hi) in KDF_LIMITS.items():
+            value = params[name]
+            if isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi:
+                raise ValueError
+    except (KeyError, TypeError, ValueError) as e:
+        raise VaultError("Parámetros KDF inválidos o fuera de límites seguros.") from e
+
+
+def _validated_kdf(header: dict) -> tuple[dict, bytes]:
+    """Valida el KDF antes de entregar parámetros no confiables a Argon2."""
+    try:
+        k = header["kdf"]
+        if not isinstance(k, dict) or k.get("algo") != "argon2id":
+            raise ValueError
+        _validate_kdf_values(k)
+        salt = bytes.fromhex(k["salt"])
+        if len(salt) != cc.SALT_LEN:
+            raise ValueError
+        wrapped = header["mk_wrapped"]
+        nonce = bytes.fromhex(wrapped["nonce"])
+        ciphertext = bytes.fromhex(wrapped["ct"])
+        if len(nonce) != cc.NONCE_LEN or len(ciphertext) != cc.KEY_LEN + cc.TAG_LEN:
+            raise ValueError
+    except (KeyError, TypeError, ValueError, AttributeError, VaultError) as e:
+        raise VaultError("Cabecera de bóveda inválida o parámetros KDF inseguros.") from e
+    return k, salt
 
 
 def is_synced_location(path: Path) -> bool:
@@ -93,6 +149,7 @@ class Vault:
         self._entries: dict[str, FileEntry] = {}
         self._folders: list[str] = []
         self._pin: str | None = None   # "salt_hex:sha256_hex" del PIN de cortina
+        self._readers: weakref.WeakSet[ChunkReader] = weakref.WeakSet()
         # Un solo lock serializa las mutaciones de índice/almacén; los
         # descifrados de lectura son seguros en paralelo (AESGCM no tiene
         # estado y cada lector usa su propia caché).
@@ -104,7 +161,9 @@ class Vault:
 
     @classmethod
     def create(cls, root: Path, password: str, params: dict | None = None) -> "Vault":
+        validate_new_password(password)
         params = dict(params or cc.ARGON2_DEFAULTS)
+        _validate_kdf_values(params)
         root = Path(root)
         if root.exists() and any(root.iterdir()):
             raise VaultError("La carpeta destino existe y no está vacía.")
@@ -145,12 +204,13 @@ class Vault:
     def _unlock_mk(header: dict, password: str) -> bytearray:
         """Valida el header y desenvuelve la clave maestra. Común a bóvedas
         locales y remotas: la criptografía es idéntica venga de donde venga."""
+        if not isinstance(header, dict):
+            raise VaultError("No es una bóveda válida.")
         if header.get("magic") != cc.MAGIC:
             raise VaultError("No es una bóveda válida.")
         if header.get("version") != cc.VERSION:
             raise VaultError("Versión de bóveda no soportada por esta app.")
-        k = header["kdf"]
-        salt = bytes.fromhex(k["salt"])
+        k, salt = _validated_kdf(header)
         kek = cc.derive_kek(password.encode("utf-8"), salt, k["m_kib"], k["t"], k["p"])
         try:
             # El AAD ata el envoltorio a los parámetros KDF del header: si
@@ -167,14 +227,22 @@ class Vault:
     def open(cls, root: Path, password: str) -> "Vault":
         root = Path(root)
         try:
+            if (root / HEADER_NAME).stat().st_size > MAX_HEADER_SIZE:
+                raise VaultError("Cabecera de bóveda inesperadamente grande.")
             header = json.loads((root / HEADER_NAME).read_text())
+        except VaultError:
+            raise
         except (OSError, ValueError) as e:
             raise VaultError("No es una bóveda válida (header ilegible).") from e
         mk = cls._unlock_mk(header, password)
         v = cls(root)
         v._mk = mk
         v._keys = cc.derive_subkeys(mk)
-        v._load_index()
+        try:
+            v._load_index()
+        except BaseException:
+            v.lock()
+            raise
         return v
 
     @classmethod
@@ -184,14 +252,23 @@ class Vault:
         se escribe en el remoto, así que no hay riesgo de corromper el
         índice por conflictos de concurrencia."""
         try:
-            header = json.loads(store.read_header().decode("utf-8"))
+            header_raw = store.read_header()
+            if len(header_raw) > MAX_HEADER_SIZE:
+                raise VaultError("Cabecera remota inesperadamente grande.")
+            header = json.loads(header_raw.decode("utf-8"))
+        except VaultError:
+            raise
         except (OSError, ValueError) as e:
             raise VaultError("No se pudo leer el header remoto.") from e
         mk = cls._unlock_mk(header, password)
         v = cls(None, store=store, read_only=True)
         v._mk = mk
         v._keys = cc.derive_subkeys(mk)
-        v._load_index()
+        try:
+            v._load_index()
+        except BaseException:
+            v.lock()
+            raise
         return v
 
     @property
@@ -202,6 +279,12 @@ class Vault:
         """Borra (best-effort) el material de clave y la metadata de RAM.
         La UI debe cerrar antes visores y cargadores de miniaturas."""
         with self._lock:
+            # Un lector conservaba su propia referencia a SubKeys. Invalidar
+            # todos primero garantiza que bloquear la bóveda revoque también
+            # lectores retenidos por Qt/PyAV u otro consumidor.
+            for reader in list(self._readers):
+                reader.close()
+            self._readers.clear()
             cc.zeroize(self._mk)
             self._mk = None
             self._keys = None       # los AEAD liberan sus claves en OpenSSL
@@ -211,9 +294,9 @@ class Vault:
     def change_password(self, old: str, new: str, params: dict | None = None) -> None:
         """Cambiar contraseña = re-envolver 32 bytes. No se recifra contenido."""
         self._require_writable()
+        validate_new_password(new)
         header = json.loads((self.root / HEADER_NAME).read_text())
-        k = header["kdf"]
-        salt_old = bytes.fromhex(k["salt"])
+        k, salt_old = _validated_kdf(header)
         kek_old = cc.derive_kek(old.encode(), salt_old, k["m_kib"], k["t"], k["p"])
         try:
             w = header["mk_wrapped"]
@@ -226,6 +309,7 @@ class Vault:
             cc.zeroize(kek_old)
 
         p = dict(params or cc.ARGON2_DEFAULTS)
+        _validate_kdf_values(p)
         salt_new = cc.random_bytes(cc.SALT_LEN)  # salt SIEMPRE nuevo con contraseña nueva
         kek_new = cc.derive_kek(new.encode(), salt_new, **p)
         try:
@@ -541,12 +625,15 @@ class Vault:
         # chunk a chunk, nunca hay una copia entera ni un temporal en claro.
         reader = src_vault.open_reader(entry.id)
         try:
-            thumb = src_vault.read_thumb(entry.id)
-        except Exception:
-            thumb = None
-        self.ensure_folder(dst_folder)
-        new = self._import_stream(reader, entry.size, entry.name, entry.mtime,
-                                  entry.mime, thumb, dst_folder)
+            try:
+                thumb = src_vault.read_thumb(entry.id)
+            except Exception:
+                thumb = None
+            self.ensure_folder(dst_folder)
+            new = self._import_stream(reader, entry.size, entry.name, entry.mtime,
+                                      entry.mime, thumb, dst_folder)
+        finally:
+            reader.close()
         with self._lock:
             new.marks = copy.deepcopy(entry.marks)
             new.rotation = entry.rotation
@@ -667,7 +754,14 @@ class Vault:
         return payload[4 : 4 + ln]
 
     def open_reader(self, entry_id: str) -> "ChunkReader":
-        return ChunkReader(self, self._entries[entry_id])
+        reader = ChunkReader(self, self._entries[entry_id])
+        with self._lock:
+            # lock() pudo adelantarse entre construir y registrar.
+            if self._keys is None:
+                reader.close()
+                raise VaultError("La bóveda está bloqueada.")
+            self._readers.add(reader)
+        return reader
 
     # ---- PIN de cortina (ocultar/mostrar contenido en pantalla) ----
     #
@@ -769,12 +863,15 @@ class Vault:
             dst = Path(dst_dir) / f"{Path(e.name).stem} ({n}){Path(e.name).suffix}"
             n += 1
         reader = self.open_reader(entry_id)
-        with open(dst, "wb") as f:
-            while True:
-                data = reader.read(cc.CHUNK_SIZE)
-                if not data:
-                    break
-                f.write(data)
+        try:
+            with open(dst, "wb") as f:
+                while True:
+                    data = reader.read(cc.CHUNK_SIZE)
+                    if not data:
+                        break
+                    f.write(data)
+        finally:
+            reader.close()
         os.utime(dst, (e.mtime, e.mtime))  # restaurar la fecha original
         return dst
 
@@ -806,46 +903,52 @@ class ChunkReader:
         self._store = vault.store
         self._entry = entry
         self._pos = 0
-        self._cache: OrderedDict[int, bytes] = OrderedDict()
+        self._cache: OrderedDict[int, bytearray] = OrderedDict()
         self._cache_max = cache_chunks
         self._mutex = threading.Lock()
         self._last_idx: int | None = None   # detectar saltos de reproducción
 
+    def _require_open(self) -> tuple[cc.SubKeys, object, FileEntry]:
+        if self._keys is None or self._store is None or self._entry is None:
+            raise ValueError("Operación sobre un lector cerrado o una bóveda bloqueada.")
+        return self._keys, self._store, self._entry
+
     @property
     def size(self) -> int:
-        return self._entry.size
+        return self._require_open()[2].size
 
     def _chunk(self, idx: int) -> bytes:
         cached = self._cache.get(idx)
         if cached is not None:
             self._cache.move_to_end(idx)
             return cached
-        e = self._entry
+        keys, store, e = self._require_open()
         # Salto de reproducción: cancelar las pre-cargas del punto antiguo
         # para que TODO el ancho de banda vaya al nuevo punto.
         if self._last_idx is not None and abs(idx - self._last_idx) > 1:
-            cancel = getattr(self._store, "cancel_prefetch", None)
+            cancel = getattr(store, "cancel_prefetch", None)
             if cancel is not None:
                 cancel()
         self._last_idx = idx
-        sealed = self._store.read(e.chunks[idx])
+        sealed = store.read(e.chunks[idx])
         # AAD = (archivo, posición, total): un blob movido de sitio o de
         # archivo NO descifra. La integridad se comprueba chunk a chunk,
         # antes de usar los datos, no al final del archivo.
-        plain = cc.open_sealed(
-            self._keys.content, sealed, cc.chunk_aad(e.file_id, idx, e.total_chunks)
-        )
+        plain = bytearray(cc.open_sealed(
+            keys.content, sealed, cc.chunk_aad(e.file_id, idx, e.total_chunks)
+        ))
         # Recortar el padding del último chunk a la longitud real.
         if idx == e.total_chunks - 1:
             real = e.size - idx * cc.CHUNK_SIZE
-            plain = plain[:real]
+            del plain[real:]
         self._cache[idx] = plain
         if len(self._cache) > self._cache_max:
-            self._cache.popitem(last=False)
+            _, evicted = self._cache.popitem(last=False)
+            cc.zeroize(evicted)
         # Lectura adelantada en almacenes remotos: pedir YA los próximos
         # chunks en segundo plano. Reproducir fluye, y tras un salto la
         # ventana de pre-carga sigue al nuevo punto automáticamente.
-        pf = getattr(self._store, "prefetch", None)
+        pf = getattr(store, "prefetch", None)
         if pf is not None:
             nxt = e.chunks[idx + 1: idx + 4]
             if nxt:
@@ -856,6 +959,7 @@ class ChunkReader:
 
     def read(self, n: int = -1) -> bytes:
         with self._mutex:
+            self._require_open()
             if n < 0:
                 n = self._entry.size - self._pos
             n = max(0, min(n, self._entry.size - self._pos))
@@ -868,10 +972,13 @@ class ChunkReader:
                 out += piece
                 self._pos += len(piece)
                 n -= len(piece)
-            return bytes(out)
+            result = bytes(out)
+            cc.zeroize(out)
+            return result
 
     def seek(self, pos: int, whence: int = 0) -> int:
         with self._mutex:
+            self._require_open()
             if whence == 1:
                 pos += self._pos
             elif whence == 2:
@@ -880,6 +987,7 @@ class ChunkReader:
             return self._pos
 
     def tell(self) -> int:
+        self._require_open()
         return self._pos
 
     def prefetch_ahead(self, n: int = 8, start_idx: int | None = None,
@@ -892,13 +1000,14 @@ class ChunkReader:
         el reproductor consume: contiguo al reproducir y correcto en pausa
         (los próximos bytes que pedirá al reanudar). Cada tick pide el
         siguiente lote (n) aún no descargado dentro del horizonte."""
-        pf = getattr(self._store, "prefetch", None)
-        if pf is None or not self._entry.chunks:
+        _, store, entry = self._require_open()
+        pf = getattr(store, "prefetch", None)
+        if pf is None or not entry.chunks:
             return
         idx = start_idx if start_idx is not None else self._pos // cc.CHUNK_SIZE
-        idx = max(0, min(idx, self._entry.total_chunks - 1))
-        down = getattr(self._store, "downloaded", None) or set()
-        window = self._entry.chunks[idx: idx + horizon]
+        idx = max(0, min(idx, entry.total_chunks - 1))
+        down = getattr(store, "downloaded", None) or set()
+        window = entry.chunks[idx: idx + horizon]
         pending = [c for c in window if c not in down][:n]
         if pending:
             pf(pending)
@@ -907,14 +1016,15 @@ class ChunkReader:
         """Tramos [0..1] del video ya descargados en esta sesión, para
         pintar el mapa de buffer en la barra de avance. En almacenes
         locales todo está 'cargado'."""
-        total = self._entry.total_chunks
+        _, store, entry = self._require_open()
+        total = entry.total_chunks
         if not total:
             return []
-        down = getattr(self._store, "downloaded", None)
+        down = getattr(store, "downloaded", None)
         if down is None:
             return [(0.0, 1.0)]
         have = sorted(set(self._cache) |
-                      {i for i, c in enumerate(self._entry.chunks) if c in down})
+                      {i for i, c in enumerate(entry.chunks) if c in down})
         ranges: list[tuple[float, float]] = []
         start = prev = None
         for i in have:
@@ -929,4 +1039,10 @@ class ChunkReader:
 
     def close(self) -> None:
         with self._mutex:
-            self._cache.clear()  # soltar los chunks descifrados cuanto antes
+            for plain in self._cache.values():
+                cc.zeroize(plain)
+            self._cache.clear()
+            self._last_idx = None
+            self._keys = None
+            self._store = None
+            self._entry = None

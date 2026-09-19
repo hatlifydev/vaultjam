@@ -15,7 +15,7 @@ from vaultjam.thumbs import make_thumbnail
 from vaultjam.vault import Vault
 
 FAST = {"m_kib": 8192, "t": 1, "p": 1}
-PW = "clave-de-sync"
+PW = "clave-segura-de-sync"
 
 
 class MemOps:

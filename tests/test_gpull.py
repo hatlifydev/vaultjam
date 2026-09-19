@@ -42,16 +42,16 @@ def _make_vault(path: Path, pw: str) -> Vault:
 def test_import_mode_distinct_vault(tmp_path):
     # Origen: bóveda distinta con un archivo.
     src_dir = tmp_path / "origen.vault"
-    src = _make_vault(src_dir, "clave-origen")
+    src = _make_vault(src_dir, "clave-origen-segura")
     payload = b"contenido de prueba \x00\x01\x02" * 5000  # ~ varios chunks
     e0 = src.import_bytes("foto.jpg", payload, "image", b"thumbjpeg", folder="viaje")
     src.set_favorite(e0.id, True)
     src.lock()
 
     # Destino: bóveda local vacía con OTRA contraseña (⇒ otra clave maestra).
-    dst = _make_vault(tmp_path / "destino.vault", "clave-destino")
+    dst = _make_vault(tmp_path / "destino.vault", "clave-destino-segura")
 
-    src_ro = Vault.open_remote(DirRemote(src_dir), "clave-origen")
+    src_ro = Vault.open_remote(DirRemote(src_dir), "clave-origen-segura")
     imp = CloudImport(src_ro, dst)
     assert imp.same_vault is False and imp.mode == "importar"
 
@@ -76,7 +76,7 @@ def test_import_mode_distinct_vault(tmp_path):
 def test_mirror_mode_same_vault_restores_missing(tmp_path):
     # Bóveda V con un archivo.
     v_dir = tmp_path / "V.vault"
-    v = _make_vault(v_dir, "misma-clave")
+    v = _make_vault(v_dir, "misma-clave-segura")
     payload = b"pixeles" * 40000
     # Carpeta NO vacía a propósito: el injerto añade la carpeta al índice
     # mientras sostiene el lock, lo que destapó un auto-bloqueo (lock no
@@ -96,7 +96,7 @@ def test_mirror_mode_same_vault_restores_missing(tmp_path):
     assert v.entries() == []
 
     # Abrir el espejo (misma contraseña ⇒ misma clave maestra) y traer.
-    src_ro = Vault.open_remote(DirRemote(mirror_dir), "misma-clave")
+    src_ro = Vault.open_remote(DirRemote(mirror_dir), "misma-clave-segura")
     imp = CloudImport(src_ro, v)
     assert imp.same_vault is True and imp.mode == "espejo"
 
@@ -115,7 +115,7 @@ def test_mirror_mode_same_vault_restores_missing(tmp_path):
 def test_import_parallel_many_entries(tmp_path):
     # Origen con varios archivos de contenido distinto; se traen en paralelo.
     src_dir = tmp_path / "orig.vault"
-    src = _make_vault(src_dir, "po")
+    src = _make_vault(src_dir, "password-origen-seguro")
     originales = {}
     for i in range(9):
         data = bytes([i]) * (7000 + i * 137)      # tamaños/contenidos únicos
@@ -123,8 +123,8 @@ def test_import_parallel_many_entries(tmp_path):
         originales[f"f{i}.jpg"] = data
     src.lock()
 
-    dst = _make_vault(tmp_path / "dst.vault", "pd")
-    imp = CloudImport(Vault.open_remote(DirRemote(src_dir), "po"), dst)
+    dst = _make_vault(tmp_path / "dst.vault", "password-destino-seguro")
+    imp = CloudImport(Vault.open_remote(DirRemote(src_dir), "password-origen-seguro"), dst)
     ids = [e.id for e in imp.src.entries()]
 
     res = imp.run(ids, workers=6)
@@ -142,9 +142,9 @@ def test_import_parallel_many_entries(tmp_path):
 
 
 def test_same_master_key_detection(tmp_path):
-    a = _make_vault(tmp_path / "a.vault", "p1")
+    a = _make_vault(tmp_path / "a.vault", "password-seguro-a")
     shutil.copytree(tmp_path / "a.vault", tmp_path / "a-copy.vault")
-    a_copy = Vault.open_remote(DirRemote(tmp_path / "a-copy.vault"), "p1")
-    b = _make_vault(tmp_path / "b.vault", "p2")
+    a_copy = Vault.open_remote(DirRemote(tmp_path / "a-copy.vault"), "password-seguro-a")
+    b = _make_vault(tmp_path / "b.vault", "password-seguro-b")
     assert a.same_master_key(a_copy) is True     # misma bóveda
     assert a.same_master_key(b) is False         # bóvedas distintas

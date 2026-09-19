@@ -21,11 +21,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..vault import Vault, VaultError, is_synced_location
+from ..vault import (
+    MIN_NEW_PASSWORD_LEN,
+    Vault,
+    VaultError,
+    is_synced_location,
+)
 from ..crypto_core import VaultCryptoError
 from ..winsec import set_capture_protection
 
-MIN_PASSWORD_LEN = 8
+MIN_PASSWORD_LEN = MIN_NEW_PASSWORD_LEN
 
 MAX_RECENTS = 8
 

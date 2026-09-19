@@ -175,6 +175,47 @@ def test_locked_vault_refuses_operations(tmp_path, vault):
         vault.read_thumb(e.id)
 
 
+def test_lock_invalidates_existing_reader_and_purges_cache(tmp_path, vault):
+    e = vault.import_file(make_big_file(tmp_path), "video", None)
+    reader = vault.open_reader(e.id)
+    assert reader.read(10)
+    cached = next(iter(reader._cache.values()))
+    vault.lock()
+    assert bytes(cached) == b"\x00" * len(cached)
+    assert reader._keys is None and reader._entry is None
+    with pytest.raises(ValueError):
+        reader.read(1)
+
+
+def test_new_password_policy_does_not_block_opening_existing_vault(tmp_path):
+    root = tmp_path / "legacy.vault"
+    # Simula una bóveda antigua creada antes de la política nueva.
+    from unittest.mock import patch
+    with patch("vaultjam.vault.validate_new_password"):
+        old = Vault.create(root, "corta123", FAST)
+    old.lock()
+    reopened = Vault.open(root, "corta123")
+    assert not reopened.is_locked
+    with pytest.raises(VaultError):
+        Vault.create(tmp_path / "new.vault", "corta123", FAST)
+
+
+def test_rejects_hostile_kdf_parameters_before_argon2(tmp_path, vault):
+    vault.lock()
+    header_path = tmp_path / "v.vault" / "header.json"
+    header = json.loads(header_path.read_text())
+    header["kdf"]["m_kib"] = 2**40
+    header_path.write_text(json.dumps(header))
+    with pytest.raises(VaultError, match="KDF"):
+        Vault.open(tmp_path / "v.vault", PW)
+
+
+def test_rejects_unsafe_kdf_parameters_on_create(tmp_path):
+    with pytest.raises(VaultError, match="KDF"):
+        Vault.create(tmp_path / "bad.vault", PW,
+                     {"m_kib": 2**40, "t": 1, "p": 1})
+
+
 def test_tiny_file(tmp_path, vault):
     p = tmp_path / "chico.jpg"
     p.write_bytes(b"abc")
